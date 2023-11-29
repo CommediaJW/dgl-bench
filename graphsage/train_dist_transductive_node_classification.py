@@ -213,7 +213,6 @@ def run(args, device, data):
                 num_seeds += len(blocks[-1].dstdata[dgl.NID])
                 num_inputs += len(blocks[0].srcdata[dgl.NID])
                 blocks = [block.to(device) for block in blocks]
-                batch_inputs = batch_inputs.to(device)
                 batch_labels = batch_labels.to(device)
                 if args.breakdown:
                     dist.barrier()
@@ -229,6 +228,7 @@ def run(args, device, data):
                 forward_time += time.time() - forward_start
 
                 backward_begin = time.time()
+                emb_optimizer.zero_grad()
                 optimizer.zero_grad()
                 loss.backward()
                 if args.breakdown:
@@ -254,6 +254,8 @@ def run(args, device, data):
                 step_time.append(step_t)
                 iter_tput.append(len(blocks[-1].dstdata[dgl.NID]) / step_t)
 
+                tic_step = time.time()
+
             if args.log_acc:
                 acc = compute_acc(batch_pred, batch_labels)
                 gpu_mem_alloc = (th.cuda.max_memory_allocated() /
@@ -276,8 +278,6 @@ def run(args, device, data):
                 if dist.get_rank() == 0:
                     print("Epoch {:05d} | All parts train acc {:.4f}".format(
                         epoch, all_reduce_acc))
-
-            tic_step = time.time()
 
         toc = time.time()
         epoch += 1
@@ -316,32 +316,32 @@ def run(args, device, data):
         emb_update_time_log.append(emb_update_time)
         epoch_time_log.append(toc - tic)
 
-        if args.eval_acc:
-            start = time.time()
-            val_acc, test_acc = evaluate(
-                args.standalone,
-                model,
-                emb_layer,
-                g,
-                g.ndata["labels"],
-                val_nid,
-                test_nid,
-                args.batch_size_eval,
-                device,
-            )
-            print("Part {}, Val Acc {:.4f}, Test Acc {:.4f}, time: {:.4f}".
-                  format(dist.get_rank(), val_acc, test_acc,
-                         time.time() - start))
-            acc_reduce_tensor = torch.tensor([val_acc, test_acc],
-                                             dtype=torch.float32)
-            dist.all_reduce(acc_reduce_tensor, dist.ReduceOp.SUM)
-            all_reduce_val_acc = acc_reduce_tensor[0].item(
-            ) / dist.get_world_size()
-            all_reduce_test_acc = acc_reduce_tensor[1].item(
-            ) / dist.get_world_size()
-            if dist.get_rank() == 0:
-                print("All parts val acc {:.4f}, test acc {:.4f}".format(
-                    all_reduce_val_acc, all_reduce_test_acc))
+    if args.eval_acc:
+        start = time.time()
+        val_acc, test_acc = evaluate(
+            args.standalone,
+            model,
+            emb_layer,
+            g,
+            g.ndata["labels"],
+            val_nid,
+            test_nid,
+            args.batch_size_eval,
+            device,
+        )
+        print("Part {}, Val Acc {:.4f}, Test Acc {:.4f}, time: {:.4f}".format(
+            dist.get_rank(), val_acc, test_acc,
+            time.time() - start))
+        acc_reduce_tensor = torch.tensor([val_acc, test_acc],
+                                         dtype=torch.float32)
+        dist.all_reduce(acc_reduce_tensor, dist.ReduceOp.SUM)
+        all_reduce_val_acc = acc_reduce_tensor[0].item() / dist.get_world_size(
+        )
+        all_reduce_test_acc = acc_reduce_tensor[1].item(
+        ) / dist.get_world_size()
+        if dist.get_rank() == 0:
+            print("All parts val acc {:.4f}, test acc {:.4f}".format(
+                all_reduce_val_acc, all_reduce_test_acc))
 
     avg_epoch_time = np.mean(epoch_time_log[2:])
     avg_sample_time = np.mean(sample_time_log[2:])
