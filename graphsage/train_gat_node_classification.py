@@ -7,7 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import dgl
-from models import SAGE, compute_acc
+from models import GAT, compute_acc
 import torch.distributed as dist
 import torch
 
@@ -56,8 +56,15 @@ def run(rank, world_size, data, args):
                                             use_ddp=True,
                                             use_uva=True)
     # Define model and optimizer
-    model = SAGE(g.ndata["features"].shape[1], args.num_hidden, n_classes,
-                 len(fan_out), F.relu, args.dropout)
+    gat_heads = [int(head) for head in args.heads.split(",")]
+    model = GAT(g.ndata["features"].shape[1],
+                args.num_hidden,
+                n_classes,
+                len(fan_out),
+                gat_heads,
+                activation=F.relu,
+                feat_dropout=args.feat_dropout,
+                attn_dropout=args.attn_dropout)
     model = model.to(device)
     model = nn.parallel.DistributedDataParallel(model,
                                                 device_ids=[rank],
@@ -317,14 +324,16 @@ if __name__ == "__main__":
         help="the number of GPU device. Use -1 for CPU training",
     )
     parser.add_argument("--num_epochs", type=int, default=20)
-    parser.add_argument("--num_hidden", type=int, default=256)
+    parser.add_argument("--num_hidden", type=int, default=32)
+    parser.add_argument("--heads", type=str, default="8,8,1")
+    parser.add_argument("--feat_dropout", type=float, default=0.1)
+    parser.add_argument("--attn_dropout", type=float, default=0.1)
     parser.add_argument("--fan_out", type=str, default="5,10,15")
     parser.add_argument("--batch_size", type=int, default=1024)
     parser.add_argument("--batch_size_eval", type=int, default=100000)
     parser.add_argument("--log_every", type=int, default=20)
     parser.add_argument("--eval_every", type=int, default=5)
     parser.add_argument("--lr", type=float, default=0.003)
-    parser.add_argument("--dropout", type=float, default=0.5)
     parser.add_argument(
         "--dataset",
         type=str,
