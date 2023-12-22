@@ -330,7 +330,7 @@ if __name__ == "__main__":
     parser.add_argument("--attn_dropout", type=float, default=0.1)
     parser.add_argument("--fan_out", type=str, default="5,10,15")
     parser.add_argument("--batch_size", type=int, default=1024)
-    parser.add_argument("--batch_size_eval", type=int, default=100000)
+    parser.add_argument("--batch_size_eval", type=int, default=50000)
     parser.add_argument("--log_every", type=int, default=20)
     parser.add_argument("--eval_every", type=int, default=5)
     parser.add_argument("--lr", type=float, default=0.003)
