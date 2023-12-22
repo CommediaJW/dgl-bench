@@ -19,19 +19,10 @@ from load_graph import load_ogb, load_reddit
 torch.manual_seed(25)
 
 
-def evaluate(model, g, inputs, labels, val_nid, test_nid, batch_size, device):
-    """
-    Evaluate the model on the validation set specified by ``val_nid``.
-    g : The entire graph.
-    inputs : The features of all the nodes.
-    labels : The labels of all the nodes.
-    val_nid : the node Ids for validation.
-    batch_size : Number of nodes to compute at the same time.
-    device : The GPU device to evaluate on.
-    """
+def evaluate(model, g, labels, val_nid, test_nid, batch_size):
     model.eval()
     with th.no_grad():
-        pred = model.inference(g, inputs, batch_size, device)
+        pred = model.inference(g, batch_size)
     model.train()
     return compute_acc(pred[val_nid],
                        labels[val_nid]), compute_acc(pred[test_nid],
@@ -148,6 +139,23 @@ def run(rank, world_size, data, args):
                 iter_tput.append(len(blocks[-1].dstdata[dgl.NID]) / step_t)
                 tic_step = time.time()
 
+                if (step + 1) % args.log_every == 0:
+                    acc = compute_acc(batch_pred, batch_labels)
+                    gpu_mem_alloc = (torch.cuda.max_memory_allocated() /
+                                     1000000
+                                     if torch.cuda.is_available() else 0)
+                    print(
+                        "Part {} | Epoch {:05d} | Step {:05d} | Loss {:.4f} | "
+                        "Train Acc {:.4f} | GPU {:.1f} MB".format(
+                            rank, epoch, step + 1, loss.item(), acc.item(),
+                            gpu_mem_alloc))
+                    train_acc_tensor = torch.tensor([acc.item()]).cuda()
+                    dist.all_reduce(train_acc_tensor, dist.ReduceOp.SUM)
+                    train_acc_tensor /= world_size
+                    if rank == 0:
+                        print("Avg train acc {:.4f}".format(
+                            train_acc_tensor[0].item()))
+
         toc = time.time()
         epoch += 1
 
@@ -181,6 +189,26 @@ def run(rank, world_size, data, args):
         backward_time_log.append(backward_time)
         update_time_log.append(update_time)
         epoch_time_log.append(toc - tic)
+
+        if epoch % args.eval_every == 0:
+            tic = time.time()
+            val_acc, test_acc = evaluate(
+                model.module,
+                g,
+                g.ndata["labels"],
+                val_nid,
+                test_nid,
+                args.batch_size_eval,
+            )
+            print("Part {}, Val Acc {:.4f}, Test Acc {:.4f}, time: {:.4f}".
+                  format(rank, val_acc, test_acc,
+                         time.time() - tic))
+            acc_tensor = torch.tensor([val_acc, test_acc]).cuda()
+            dist.all_reduce(acc_tensor, dist.ReduceOp.SUM)
+            acc_tensor /= world_size
+            if rank == 0:
+                print("All parts avg val acc {:.4f}, test acc {:.4f}".format(
+                    acc_tensor[0].item(), acc_tensor[1].item()))
 
     avg_epoch_time = np.mean(epoch_time_log[2:])
     avg_sample_time = np.mean(sample_time_log[2:])
@@ -289,10 +317,10 @@ if __name__ == "__main__":
         help="the number of GPU device. Use -1 for CPU training",
     )
     parser.add_argument("--num_epochs", type=int, default=20)
-    parser.add_argument("--num_hidden", type=int, default=16)
+    parser.add_argument("--num_hidden", type=int, default=256)
     parser.add_argument("--num_layers", type=int, default=3)
     parser.add_argument("--fan_out", type=str, default="5,10,15")
-    parser.add_argument("--batch_size", type=int, default=1000)
+    parser.add_argument("--batch_size", type=int, default=1024)
     parser.add_argument("--batch_size_eval", type=int, default=100000)
     parser.add_argument("--log_every", type=int, default=20)
     parser.add_argument("--eval_every", type=int, default=5)
