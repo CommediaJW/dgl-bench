@@ -81,3 +81,45 @@ def inductive_split(g):
     val_g = g.subgraph(g.ndata["train_mask"] | g.ndata["val_mask"])
     test_g = g
     return train_g, val_g, test_g
+
+
+def load_dataset(path,
+                 dataset_name,
+                 with_feature=True,
+                 with_valid=True,
+                 with_test=True):
+    print("load {}...".format(dataset_name))
+    meta_data = th.load(os.path.join(path, "metadata.pt"))
+    assert meta_data["dataset"] == dataset_name
+
+    labels = th.load(os.path.join(path, "labels.pt"))
+    indptr = th.load(os.path.join(path, "indptr.pt"))
+    indices = th.load(os.path.join(path, "indices.pt"))
+    train_idx = th.load(os.path.join(path, "train_idx.pt"))
+
+    if with_feature:
+        features = th.load(os.path.join(path, "features.pt"))
+
+    if with_valid:
+        valid_idx = th.load(os.path.join(path, "valid_idx.pt"))
+
+    if with_test:
+        test_idx = th.load(os.path.join(path, "test_idx.pt"))
+
+    graph_tensors = {
+        "labels": labels,
+        "indptr": indptr,
+        "indices": indices,
+        "train_idx": train_idx,
+    }
+
+    if with_feature:
+        graph_tensors["features"] = features
+    if with_valid:
+        graph_tensors["valid_idx"] = valid_idx
+    if with_test:
+        graph_tensors["test_idx"] = test_idx
+
+    print("finish loading {}...".format(dataset_name))
+
+    return graph_tensors, meta_data

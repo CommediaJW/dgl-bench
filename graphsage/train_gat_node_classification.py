@@ -2,31 +2,20 @@ import argparse
 import time
 
 import numpy as np
-import torch as th
+import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import dgl
-from models import GAT, compute_acc
-import torch.distributed as dist
-import torch
+from models import GAT, compute_acc, evaluate
 
 import sys
 
 sys.path.append("utils")
-from load_graph import load_ogb, load_reddit
+from load_graph import load_dataset
 
 torch.manual_seed(25)
-
-
-def evaluate(model, g, labels, val_nid, test_nid, batch_size):
-    model.eval()
-    with th.no_grad():
-        pred = model.inference(g, batch_size)
-    model.train()
-    return compute_acc(pred[val_nid],
-                       labels[val_nid]), compute_acc(pred[test_nid],
-                                                     labels[test_nid])
 
 
 def run(rank, world_size, data, args):
@@ -38,7 +27,6 @@ def run(rank, world_size, data, args):
                             rank=rank)
     # Unpack data
     train_nid, val_nid, test_nid, n_classes, g = data
-    shuffle = True
     fan_out = [int(fanout) for fanout in args.fan_out.split(",")]
     sampler = dgl.dataloading.NeighborSampler(
         fan_out,
@@ -50,7 +38,7 @@ def run(rank, world_size, data, args):
                                             sampler,
                                             device=device,
                                             batch_size=args.batch_size,
-                                            shuffle=shuffle,
+                                            shuffle=True,
                                             drop_last=False,
                                             num_workers=0,
                                             use_ddp=True,
@@ -73,16 +61,13 @@ def run(rank, world_size, data, args):
     loss_fcn = loss_fcn.to(device)
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
 
-    iter_tput = []
     epoch_time_log = []
     sample_time_log = []
     load_time_log = []
     forward_time_log = []
     backward_time_log = []
     update_time_log = []
-    epoch = 0
     for epoch in range(args.num_epochs):
-        tic = time.time()
 
         sample_time = 0
         load_time = 0
@@ -91,84 +76,75 @@ def run(rank, world_size, data, args):
         update_time = 0
         num_seeds = 0
         num_inputs = 0
+        num_iters = 0
 
-        with model.join():
-            # Loop over the dataloader to sample the computation dependency
-            # graph as a list of blocks.
-            step_time = []
+        if args.breakdown:
+            dist.barrier()
+            torch.cuda.synchronize()
+        epoch_tic = time.time()
+        sample_begin = time.time()
+        model.train()
+        for step, (input_nodes, seeds, blocks) in enumerate(dataloader):
+            num_iters += 1
             if args.breakdown:
                 dist.barrier()
                 torch.cuda.synchronize()
-            tic = time.time()
-            tic_step = time.time()
-            for step, (input_nodes, seeds, blocks) in enumerate(dataloader):
-                if args.breakdown:
-                    dist.barrier()
-                    torch.cuda.synchronize()
-                sample_time += time.time() - tic_step
+            sample_time += time.time() - sample_begin
 
-                load_begin = time.time()
-                batch_inputs = blocks[0].srcdata["features"]
-                batch_labels = blocks[-1].dstdata["labels"]
-                batch_labels = batch_labels.long()
-                num_seeds += len(blocks[-1].dstdata[dgl.NID])
-                num_inputs += len(blocks[0].srcdata[dgl.NID])
-                if args.breakdown:
-                    dist.barrier()
-                    torch.cuda.synchronize()
-                load_time += time.time() - load_begin
+            load_begin = time.time()
+            batch_inputs = blocks[0].srcdata["features"]
+            batch_labels = blocks[-1].dstdata["labels"]
+            batch_labels = batch_labels.long()
+            num_seeds += len(blocks[-1].dstdata[dgl.NID])
+            num_inputs += len(blocks[0].srcdata[dgl.NID])
+            if args.breakdown:
+                dist.barrier()
+                torch.cuda.synchronize()
+            load_time += time.time() - load_begin
 
-                forward_start = time.time()
-                batch_pred = model(blocks, batch_inputs)
-                loss = loss_fcn(batch_pred, batch_labels)
-                if args.breakdown:
-                    dist.barrier()
-                    torch.cuda.synchronize()
-                forward_time += time.time() - forward_start
+            forward_start = time.time()
+            batch_pred = model(blocks, batch_inputs)
+            loss = loss_fcn(batch_pred, batch_labels)
+            if args.breakdown:
+                dist.barrier()
+                torch.cuda.synchronize()
+            forward_time += time.time() - forward_start
 
-                backward_begin = time.time()
-                optimizer.zero_grad()
-                loss.backward()
-                if args.breakdown:
-                    dist.barrier()
-                    torch.cuda.synchronize()
-                backward_time += time.time() - backward_begin
+            backward_begin = time.time()
+            optimizer.zero_grad()
+            loss.backward()
+            if args.breakdown:
+                dist.barrier()
+                torch.cuda.synchronize()
+            backward_time += time.time() - backward_begin
 
-                update_start = time.time()
-                optimizer.step()
-                if args.breakdown:
-                    dist.barrier()
-                    torch.cuda.synchronize()
-                update_time += time.time() - update_start
+            update_start = time.time()
+            optimizer.step()
+            if args.breakdown:
+                dist.barrier()
+                torch.cuda.synchronize()
+            update_time += time.time() - update_start
 
-                step_t = time.time() - tic_step
-                step_time.append(step_t)
-                iter_tput.append(len(blocks[-1].dstdata[dgl.NID]) / step_t)
-                tic_step = time.time()
+            if (step + 1) % args.log_every == 0:
+                acc = compute_acc(batch_pred, batch_labels)
+                gpu_mem_alloc = (torch.cuda.max_memory_allocated() /
+                                 1000000 if torch.cuda.is_available() else 0)
+                print("Part {} | Epoch {:05d} | Step {:05d} | Loss {:.4f} | "
+                      "Train Acc {:.4f} | GPU {:.1f} MB".format(
+                          rank, epoch, step + 1, loss.item(), acc.item(),
+                          gpu_mem_alloc))
+                train_acc_tensor = torch.tensor([acc.item()]).cuda()
+                dist.all_reduce(train_acc_tensor, dist.ReduceOp.SUM)
+                train_acc_tensor /= world_size
+                if rank == 0:
+                    print("Avg train acc {:.4f}".format(
+                        train_acc_tensor[0].item()))
 
-                if (step + 1) % args.log_every == 0:
-                    acc = compute_acc(batch_pred, batch_labels)
-                    gpu_mem_alloc = (torch.cuda.max_memory_allocated() /
-                                     1000000
-                                     if torch.cuda.is_available() else 0)
-                    print(
-                        "Part {} | Epoch {:05d} | Step {:05d} | Loss {:.4f} | "
-                        "Train Acc {:.4f} | GPU {:.1f} MB".format(
-                            rank, epoch, step + 1, loss.item(), acc.item(),
-                            gpu_mem_alloc))
-                    train_acc_tensor = torch.tensor([acc.item()]).cuda()
-                    dist.all_reduce(train_acc_tensor, dist.ReduceOp.SUM)
-                    train_acc_tensor /= world_size
-                    if rank == 0:
-                        print("Avg train acc {:.4f}".format(
-                            train_acc_tensor[0].item()))
+        epoch_toc = time.time()
 
-        toc = time.time()
-        epoch += 1
-
-        for i in range(args.num_gpus):
+        for i in range(args.num_trainers):
             dist.barrier()
-            if i == dist.get_rank() % args.num_gpus:
+            if i == rank % args.num_trainers:
                 timetable = ("=====================\n"
                              "Part {}, Epoch Time(s): {:.4f}\n"
                              "Sampling Time(s): {:.4f}\n"
@@ -178,9 +154,10 @@ def run(rank, world_size, data, args):
                              "Update Time(s): {:.4f}\n"
                              "#seeds: {}\n"
                              "#inputs: {}\n"
+                             "#iterations: {}\n"
                              "=====================".format(
-                                 dist.get_rank(),
-                                 toc - tic,
+                                 rank,
+                                 epoch_toc - epoch_tic,
                                  sample_time,
                                  load_time,
                                  forward_time,
@@ -188,6 +165,7 @@ def run(rank, world_size, data, args):
                                  update_time,
                                  num_seeds,
                                  num_inputs,
+                                 num_iters,
                              ))
                 print(timetable)
         sample_time_log.append(sample_time)
@@ -195,9 +173,9 @@ def run(rank, world_size, data, args):
         forward_time_log.append(forward_time)
         backward_time_log.append(backward_time)
         update_time_log.append(update_time)
-        epoch_time_log.append(toc - tic)
+        epoch_time_log.append(epoch_toc - epoch_tic)
 
-        if epoch % args.eval_every == 0:
+        if (epoch + 1) % args.eval_every == 0:
             tic = time.time()
             val_acc, test_acc = evaluate(
                 model.module,
@@ -224,9 +202,9 @@ def run(rank, world_size, data, args):
     avg_backward_time = np.mean(backward_time_log[2:])
     avg_update_time = np.mean(update_time_log[2:])
 
-    for i in range(args.num_gpus):
-        th.distributed.barrier()
-        if i == th.distributed.get_rank() % args.num_gpus:
+    for i in range(args.num_trainers):
+        dist.barrier()
+        if i == rank % args.num_trainers:
             timetable = ("=====================\n"
                          "Part {}, Avg Time:\n"
                          "Epoch Time(s): {:.4f}\n"
@@ -236,7 +214,7 @@ def run(rank, world_size, data, args):
                          "Backward Time(s): {:.4f}\n"
                          "Update Time(s): {:.4f}\n"
                          "=====================".format(
-                             th.distributed.get_rank(),
+                             rank,
                              avg_epoch_time,
                              avg_sample_time,
                              avg_load_time,
@@ -249,35 +227,32 @@ def run(rank, world_size, data, args):
 
     all_reduce_tensor[0] = avg_epoch_time
     dist.all_reduce(all_reduce_tensor, dist.ReduceOp.SUM)
-    all_reduce_epoch_time = all_reduce_tensor[0].item() / dist.get_world_size()
+    all_reduce_epoch_time = all_reduce_tensor[0].item() / world_size
 
     all_reduce_tensor[0] = avg_sample_time
     dist.all_reduce(all_reduce_tensor, dist.ReduceOp.SUM)
-    all_reduce_sample_time = all_reduce_tensor[0].item() / dist.get_world_size(
-    )
+    all_reduce_sample_time = all_reduce_tensor[0].item() / world_size
 
     all_reduce_tensor[0] = avg_load_time
     dist.all_reduce(all_reduce_tensor, dist.ReduceOp.SUM)
-    all_reduce_load_time = all_reduce_tensor[0].item() / dist.get_world_size()
+    all_reduce_load_time = all_reduce_tensor[0].item() / world_size
 
     all_reduce_tensor[0] = avg_forward_time
     dist.all_reduce(all_reduce_tensor, dist.ReduceOp.SUM)
-    all_reduce_forward_time = all_reduce_tensor[0].item(
-    ) / dist.get_world_size()
+    all_reduce_forward_time = all_reduce_tensor[0].item() / world_size
 
     all_reduce_tensor[0] = avg_backward_time
     dist.all_reduce(all_reduce_tensor, dist.ReduceOp.SUM)
-    all_reduce_backward_time = all_reduce_tensor[0].item(
-    ) / dist.get_world_size()
+    all_reduce_backward_time = all_reduce_tensor[0].item() / world_size
 
     all_reduce_tensor[0] = avg_update_time
     dist.all_reduce(all_reduce_tensor, dist.ReduceOp.SUM)
-    all_reduce_update_time = all_reduce_tensor[0].item() / dist.get_world_size(
-    )
+    all_reduce_update_time = all_reduce_tensor[0].item() / world_size
 
-    if dist.get_rank() == 0:
+    if rank == 0:
         timetable = ("=====================\n"
                      "All reduce time:\n"
+                     "Throughput(seeds/sec): {:.4f}\n"
                      "Epoch Time(s): {:.4f}\n"
                      "Sampling Time(s): {:.4f}\n"
                      "Loading Time(s): {:.4f}\n"
@@ -285,6 +260,7 @@ def run(rank, world_size, data, args):
                      "Backward Time(s): {:.4f}\n"
                      "Update Time(s): {:.4f}\n"
                      "=====================".format(
+                         train_nid.shape[0] / all_reduce_epoch_time,
                          all_reduce_epoch_time,
                          all_reduce_sample_time,
                          all_reduce_load_time,
@@ -296,53 +272,84 @@ def run(rank, world_size, data, args):
 
 
 def main(args):
-    if args.dataset == "reddit":
-        g, num_classes = load_reddit()
-    elif args.dataset == "ogbn-products":
-        g, num_classes = load_ogb("ogbn-products", args.root)
-    elif args.dataset == "ogbn-papers100M":
-        g, num_classes = load_ogb("ogbn-papers100M", args.root)
-    train_nid = g.ndata["train_mask"].nonzero().flatten()
-    val_nid = g.ndata["val_mask"].nonzero().flatten()
-    test_nid = g.ndata["test_mask"].nonzero().flatten()
-    data = train_nid, val_nid, test_nid, num_classes, g
+    if args.dataset == "friendster":
+        with_feature = False
+        with_valid = False
+        with_test = False
+        feat_dtype = torch.float32
+    elif args.dataset == "mag240M":
+        with_feature = False
+        with_valid = True
+        with_test = True
+        feat_dtype = torch.float16
+    else:
+        with_feature = True
+        with_valid = True
+        with_test = True
+    g, metadata = load_dataset(args.root,
+                               args.dataset,
+                               with_feature=with_feature,
+                               with_test=with_test,
+                               with_valid=with_valid)
+    dgl_g = dgl.graph(('csc', (g["indptr"], g["indices"], torch.tensor([]))))
+    dgl_g.ndata["labels"] = g["labels"]
+    if with_feature:
+        dgl_g.ndata["features"] = g["features"]
+    else:
+        dgl_g.ndata["features"] = torch.randn(
+            (metadata["num_nodes"], ),
+            dtype=feat_dtype).reshape(-1, 1).repeat(1, metadata["feature_dim"])
+    train_nid = g["train_idx"]
+    if with_valid:
+        val_nid = g["valid_idx"]
+    else:
+        val_nid = torch.tensor([]).long()
+    if with_test:
+        test_nid = g["test_idx"]
+    else:
+        test_nid = torch.tensor([]).long()
 
-    import torch.multiprocessing as mp
-    mp.spawn(run, args=(args.num_gpus, data, args), nprocs=args.num_gpus)
+    data = train_nid, val_nid, test_nid, metadata["num_classes"], dgl_g
+    del g
+
+    num_trainers_list = args.num_trainers.split(",")
+    for num_trainers in num_trainers_list:
+        args.num_trainers = int(num_trainers)
+        import torch.multiprocessing as mp
+        mp.spawn(run,
+                 args=(args.num_trainers, data, args),
+                 nprocs=args.num_trainers)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="GCN")
-    parser.add_argument("--n_classes",
-                        type=int,
-                        default=0,
-                        help="the number of classes")
-    parser.add_argument(
-        "--num_gpus",
-        type=int,
-        default=8,
-        help="the number of GPU device. Use -1 for CPU training",
-    )
-    parser.add_argument("--num_epochs", type=int, default=20)
-    parser.add_argument("--num_hidden", type=int, default=32)
-    parser.add_argument("--heads", type=str, default="8,8,1")
-    parser.add_argument("--feat_dropout", type=float, default=0.1)
-    parser.add_argument("--attn_dropout", type=float, default=0.1)
-    parser.add_argument("--fan_out", type=str, default="5,10,15")
-    parser.add_argument("--batch_size", type=int, default=1024)
-    parser.add_argument("--batch_size_eval", type=int, default=50000)
-    parser.add_argument("--log_every", type=int, default=20)
-    parser.add_argument("--eval_every", type=int, default=5)
-    parser.add_argument("--lr", type=float, default=0.003)
-    parser.add_argument(
+    argparser = argparse.ArgumentParser(
+        "Train nodeclassification GraphSAGE model")
+    argparser.add_argument(
         "--dataset",
         type=str,
         default="ogbn-products",
-        help="datasets: reddit, ogbn-products, ogbn-papers100M",
+        help="datasets: ogbn-products, ogbn-papers100M, friendster, mag240M",
     )
-    parser.add_argument("--root", type=str, default="/data")
-    parser.add_argument("--breakdown", action="store_true")
-    args = parser.parse_args()
-
+    argparser.add_argument("--root", type=str, default="/data")
+    argparser.add_argument(
+        "--num-trainers",
+        type=str,
+        default="1,2,4,8",
+        help=
+        "number of trainers participated in the compress, no greater than available GPUs num"
+    )
+    argparser.add_argument("--lr", type=float, default=0.003)
+    argparser.add_argument("--batch-size", type=int, default=1000)
+    argparser.add_argument("--batch-size-eval", type=int, default=100000)
+    argparser.add_argument("--log-every", type=int, default=20)
+    argparser.add_argument("--eval-every", type=int, default=5)
+    argparser.add_argument("--fan-out", type=str, default="5,10,15")
+    argparser.add_argument("--num-hidden", type=int, default=32)
+    argparser.add_argument("--heads", type=str, default="8,8,1")
+    argparser.add_argument("--feat_dropout", type=float, default=0.2)
+    argparser.add_argument("--attn_dropout", type=float, default=0.2)
+    argparser.add_argument("--num-epochs", type=int, default=20)
+    argparser.add_argument("--breakdown", action="store_true", default=False)
+    args = argparser.parse_args()
     print(args)
     main(args)

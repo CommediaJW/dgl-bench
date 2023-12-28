@@ -248,3 +248,13 @@ def compute_acc(pred, labels):
     """
     labels = labels.long()
     return (th.argmax(pred, dim=1) == labels).float().sum() / len(pred)
+
+
+def evaluate(model, g, labels, val_nid, test_nid, batch_size):
+    model.eval()
+    with th.no_grad():
+        pred = model.inference(g, batch_size)
+    model.train()
+    return compute_acc(pred[val_nid],
+                       labels[val_nid]), compute_acc(pred[test_nid],
+                                                     labels[test_nid])
