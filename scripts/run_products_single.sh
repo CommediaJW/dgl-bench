@@ -1,0 +1,2 @@
+# python3 graphsage/train_gat_node_classification.py --dataset ogbn-products --root /home/ubuntu/workspace/processed_dataset/ogbn-products/ --num-trainers 1,2,4,8 --num-epochs 20 --fan-out 12,12,12 --num-hidden 8 --heads 4,4,1 --breakdown --eval-every 21
+python3 graphsage/train_graphsage_node_classification.py --dataset ogbn-products --root /home/ubuntu/workspace/processed_dataset/ogbn-products/ --num-trainers 1,2,4,8 --num-epochs 20 --fan-out 12,12,12 --num-hidden 32 --breakdown --eval-every 21

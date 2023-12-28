@@ -2,15 +2,13 @@ import argparse
 import time
 
 import numpy as np
-import torch as th
+import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-import torch.distributed as dist
 import dgl
 from models import DistSAGE, compute_acc
-
-import torch
 
 torch.manual_seed(25)
 
@@ -36,7 +34,7 @@ def evaluate(model, g, inputs, labels, val_nid, test_nid, batch_size, device):
     device : The GPU device to evaluate on.
     """
     model.eval()
-    with th.no_grad():
+    with torch.no_grad():
         pred = model.inference(g, inputs, batch_size, device)
     model.train()
     return compute_acc(pred[val_nid],
@@ -46,49 +44,45 @@ def evaluate(model, g, inputs, labels, val_nid, test_nid, batch_size, device):
 
 def run(args, device, data):
     # Unpack data
-    train_nid, val_nid, test_nid, in_feats, n_classes, g = data
-    shuffle = True
+    train_nid, val_nid, test_nid, n_classes, g = data
     # prefetch_node_feats/prefetch_labels are not supported for DistGraph yet.
-    sampler = dgl.dataloading.NeighborSampler(
-        [int(fanout) for fanout in args.fan_out.split(",")])
+    fan_out = [int(fanout) for fanout in args.fan_out.split(",")]
+    sampler = dgl.dataloading.NeighborSampler(fan_out)
     dataloader = dgl.dataloading.DistNodeDataLoader(
         g,
         train_nid,
         sampler,
         batch_size=args.batch_size,
-        shuffle=shuffle,
+        shuffle=True,
         drop_last=False,
     )
     # Define model and optimizer
     model = DistSAGE(
-        in_feats,
+        g.ndata["features"].shape[1],
         args.num_hidden,
         n_classes,
-        args.num_layers,
+        len(fan_out),
         F.relu,
         args.dropout,
     )
     model = model.to(device)
     if not args.standalone:
-        if args.num_gpus == -1:
-            model = th.nn.parallel.DistributedDataParallel(model)
+        if args.num_trainers == -1:
+            model = torch.nn.parallel.DistributedDataParallel(model)
         else:
-            model = th.nn.parallel.DistributedDataParallel(
+            model = torch.nn.parallel.DistributedDataParallel(
                 model, device_ids=[device], output_device=device)
     loss_fcn = nn.CrossEntropyLoss()
     loss_fcn = loss_fcn.to(device)
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
 
-    iter_tput = []
     epoch_time_log = []
     sample_time_log = []
     load_time_log = []
     forward_time_log = []
     backward_time_log = []
     update_time_log = []
-    epoch = 0
     for epoch in range(args.num_epochs):
-        tic = time.time()
 
         sample_time = 0
         load_time = 0
@@ -97,21 +91,20 @@ def run(args, device, data):
         update_time = 0
         num_seeds = 0
         num_inputs = 0
+        num_iters = 0
 
         with model.join():
-            # Loop over the dataloader to sample the computation dependency
-            # graph as a list of blocks.
-            step_time = []
             if args.breakdown:
                 dist.barrier()
                 torch.cuda.synchronize()
-            tic = time.time()
-            tic_step = time.time()
+            epoch_tic = time.time()
+            sample_begin = time.time()
             for step, (input_nodes, seeds, blocks) in enumerate(dataloader):
+                num_iters += 1
                 if args.breakdown:
                     dist.barrier()
                     torch.cuda.synchronize()
-                sample_time += time.time() - tic_step
+                sample_time += time.time() - sample_begin
 
                 load_begin = time.time()
                 batch_inputs, batch_labels = load_subtensor(
@@ -150,34 +143,28 @@ def run(args, device, data):
                     torch.cuda.synchronize()
                 update_time += time.time() - update_start
 
-                step_t = time.time() - tic_step
-                step_time.append(step_t)
-                iter_tput.append(len(blocks[-1].dstdata[dgl.NID]) / step_t)
-                # if step % args.log_every == 0:
-                #     acc = compute_acc(batch_pred, batch_labels)
-                #     gpu_mem_alloc = (th.cuda.max_memory_allocated() /
-                #                      1000000 if th.cuda.is_available() else 0)
-                #     print(
-                #         "Part {} | Epoch {:05d} | Step {:05d} | Loss {:.4f} | "
-                #         "Train Acc {:.4f} | Speed (samples/sec) {:.4f} | GPU "
-                #         "{:.1f} MB | time {:.3f} s".format(
-                #             g.rank(),
-                #             epoch,
-                #             step,
-                #             loss.item(),
-                #             acc.item(),
-                #             np.mean(iter_tput[3:]),
-                #             gpu_mem_alloc,
-                #             np.sum(step_time[-args.log_every:]),
-                #         ))
-                tic_step = time.time()
+                if (step + 1) % args.log_every == 0:
+                    acc = compute_acc(batch_pred, batch_labels)
+                    gpu_mem_alloc = (torch.cuda.max_memory_allocated() /
+                                     1000000
+                                     if torch.cuda.is_available() else 0)
+                    print(
+                        "Part {} | Epoch {:05d} | Step {:05d} | Loss {:.4f} | "
+                        "Train Acc {:.4f} | GPU {:.1f} MB".format(
+                            dist.get_rank(), epoch, step, loss.item(),
+                            acc.item(), gpu_mem_alloc))
+                    train_acc_tensor = torch.tensor([acc.item()]).cuda()
+                    dist.all_reduce(train_acc_tensor, dist.ReduceOp.SUM)
+                    train_acc_tensor /= dist.get_world_size()
+                    if dist.get_rank() == 0:
+                        print("Avg train acc {:.4f}".format(
+                            train_acc_tensor[0].item()))
 
-        toc = time.time()
-        epoch += 1
+            epoch_toc = time.time()
 
-        for i in range(args.num_gpus):
-            th.distributed.barrier()
-            if i == th.distributed.get_rank() % args.num_gpus:
+        for i in range(args.num_trainers):
+            dist.barrier()
+            if i == dist.get_rank() % args.num_trainers:
                 timetable = ("=====================\n"
                              "Part {}, Epoch Time(s): {:.4f}\n"
                              "Sampling Time(s): {:.4f}\n"
@@ -187,9 +174,10 @@ def run(args, device, data):
                              "Update Time(s): {:.4f}\n"
                              "#seeds: {}\n"
                              "#inputs: {}\n"
+                             "#iterations: {}\n"
                              "=====================".format(
-                                 th.distributed.get_rank(),
-                                 toc - tic,
+                                 dist.get_rank(),
+                                 epoch_toc - epoch_tic,
                                  sample_time,
                                  load_time,
                                  forward_time,
@@ -197,6 +185,7 @@ def run(args, device, data):
                                  update_time,
                                  num_seeds,
                                  num_inputs,
+                                 num_iters,
                              ))
                 print(timetable)
         sample_time_log.append(sample_time)
@@ -204,23 +193,30 @@ def run(args, device, data):
         forward_time_log.append(forward_time)
         backward_time_log.append(backward_time)
         update_time_log.append(update_time)
-        epoch_time_log.append(toc - tic)
+        epoch_time_log.append(epoch_toc - epoch_tic)
 
-        # if epoch % args.eval_every == 0 and epoch != 0:
-        #     start = time.time()
-        #     val_acc, test_acc = evaluate(
-        #         model if args.standalone else model.module,
-        #         g,
-        #         g.ndata["features"],
-        #         g.ndata["labels"],
-        #         val_nid,
-        #         test_nid,
-        #         args.batch_size_eval,
-        #         device,
-        #     )
-        #     print("Part {}, Val Acc {:.4f}, Test Acc {:.4f}, time: {:.4f}".
-        #           format(g.rank(), val_acc, test_acc,
-        #                  time.time() - start))
+        if (epoch + 1) % args.eval_every == 0 and epoch != 0:
+            start = time.time()
+            val_acc, test_acc = evaluate(
+                model if args.standalone else model.module,
+                g,
+                g.ndata["features"],
+                g.ndata["labels"],
+                val_nid,
+                test_nid,
+                args.batch_size_eval,
+                device,
+            )
+            print("Part {}, Val Acc {:.4f}, Test Acc {:.4f}, time: {:.4f}".
+                  format(dist.get_rank(), val_acc, test_acc,
+                         time.time() - start))
+            acc_tensor = torch.tensor([val_acc, test_acc]).cuda()
+            dist.all_reduce(acc_tensor, dist.ReduceOp.SUM)
+            acc_tensor /= dist.get_world_size()
+            if dist.get_rank() == 0:
+                print("All parts avg val acc {:.4f}, test acc {:.4f}".format(
+                    acc_tensor[0].item(), acc_tensor[1].item()))
+
     avg_epoch_time = np.mean(epoch_time_log[2:])
     avg_sample_time = np.mean(sample_time_log[2:])
     avg_load_time = np.mean(load_time_log[2:])
@@ -228,9 +224,9 @@ def run(args, device, data):
     avg_backward_time = np.mean(backward_time_log[2:])
     avg_update_time = np.mean(update_time_log[2:])
 
-    for i in range(args.num_gpus):
-        th.distributed.barrier()
-        if i == th.distributed.get_rank() % args.num_gpus:
+    for i in range(args.num_trainers):
+        dist.barrier()
+        if i == dist.get_rank() % args.num_trainers:
             timetable = ("=====================\n"
                          "Part {}, Avg Time:\n"
                          "Epoch Time(s): {:.4f}\n"
@@ -240,7 +236,7 @@ def run(args, device, data):
                          "Backward Time(s): {:.4f}\n"
                          "Update Time(s): {:.4f}\n"
                          "=====================".format(
-                             th.distributed.get_rank(),
+                             dist.get_rank(),
                              avg_epoch_time,
                              avg_sample_time,
                              avg_load_time,
@@ -282,6 +278,7 @@ def run(args, device, data):
     if dist.get_rank() == 0:
         timetable = ("=====================\n"
                      "All reduce time:\n"
+                     "Throughput(seeds/sec): {:.4f}\n"
                      "Epoch Time(s): {:.4f}\n"
                      "Sampling Time(s): {:.4f}\n"
                      "Loading Time(s): {:.4f}\n"
@@ -289,6 +286,7 @@ def run(args, device, data):
                      "Backward Time(s): {:.4f}\n"
                      "Update Time(s): {:.4f}\n"
                      "=====================".format(
+                         train_nid.shape[0] / all_reduce_epoch_time,
                          all_reduce_epoch_time,
                          all_reduce_sample_time,
                          all_reduce_load_time,
@@ -302,26 +300,30 @@ def run(args, device, data):
 def main(args):
     dgl.distributed.initialize(args.ip_config)
     if not args.standalone:
-        th.distributed.init_process_group(backend="nccl")
+        dist.init_process_group(backend=args.backend)
 
     g = dgl.distributed.DistGraph(args.graph_name,
                                   part_config=args.part_config)
-    print("rank:", g.rank())
+    print("rank:", dist.get_rank())
 
     pb = g.get_partition_book()
     train_nid = dgl.distributed.node_split(g.ndata["train_mask"],
                                            pb,
                                            force_even=True)
-    val_nid = dgl.distributed.node_split(g.ndata["val_mask"],
-                                         pb,
-                                         force_even=True)
-    test_nid = dgl.distributed.node_split(g.ndata["test_mask"],
-                                          pb,
-                                          force_even=True)
+    if args.graph_name != "friendster":
+        val_nid = dgl.distributed.node_split(g.ndata["val_mask"],
+                                             pb,
+                                             force_even=True)
+        test_nid = dgl.distributed.node_split(g.ndata["test_mask"],
+                                              pb,
+                                              force_even=True)
+    else:
+        val_nid = torch.tensor([])
+        test_nid = torch.tensor([])
     local_nid = pb.partid2nids(pb.partid).detach().numpy()
     print("part {}, train: {} (local: {}), val: {} (local: {}), test: {} "
           "(local: {})".format(
-              g.rank(),
+              dist.get_rank(),
               len(train_nid),
               len(np.intersect1d(train_nid.numpy(), local_nid)),
               len(val_nid),
@@ -329,19 +331,16 @@ def main(args):
               len(test_nid),
               len(np.intersect1d(test_nid.numpy(), local_nid)),
           ))
-    if args.num_gpus == -1:
-        device = th.device("cpu")
-    else:
-        dev_id = g.rank() % args.num_gpus
-        device = th.device("cuda:" + str(dev_id))
-        th.cuda.set_device(device)
+    dev_id = dist.get_rank() % args.num_trainers
+    device = torch.device("cuda:" + str(dev_id))
+    torch.cuda.set_device(device)
     labels = g.ndata["labels"][np.arange(g.num_nodes())]
-    n_classes = len(th.unique(labels[th.logical_not(th.isnan(labels))]))
+    n_classes = len(
+        torch.unique(labels[torch.logical_not(torch.isnan(labels))]))
     print("#labels:", n_classes)
 
     # Pack data
-    in_feats = g.ndata["features"].shape[1]
-    data = train_nid, val_nid, test_nid, in_feats, n_classes, g
+    data = train_nid, val_nid, test_nid, n_classes, g
     run(args, device, data)
     print("parent ends")
 
@@ -356,45 +355,33 @@ if __name__ == "__main__":
     parser.add_argument("--part_config",
                         type=str,
                         help="The path to the partition config file")
-    parser.add_argument("--n_classes",
-                        type=int,
-                        default=0,
-                        help="the number of classes")
     parser.add_argument(
         "--backend",
         type=str,
-        default="gloo",
+        default="nccl",
         help="pytorch distributed backend",
     )
     parser.add_argument(
-        "--num_gpus",
+        "--num_trainers",
         type=int,
         default=-1,
         help="the number of GPU device. Use -1 for CPU training",
     )
     parser.add_argument("--num_epochs", type=int, default=20)
-    parser.add_argument("--num_hidden", type=int, default=16)
-    parser.add_argument("--num_layers", type=int, default=3)
-    parser.add_argument("--fan_out", type=str, default="5,10,15")
+    parser.add_argument("--num_hidden", type=int, default=32)
+    parser.add_argument("--fan_out", type=str, default="12,12,12")
     parser.add_argument("--batch_size", type=int, default=1000)
     parser.add_argument("--batch_size_eval", type=int, default=100000)
     parser.add_argument("--log_every", type=int, default=20)
     parser.add_argument("--eval_every", type=int, default=5)
     parser.add_argument("--lr", type=float, default=0.003)
-    parser.add_argument("--dropout", type=float, default=0.5)
+    parser.add_argument("--dropout", type=float, default=0.2)
     parser.add_argument("--local_rank",
                         type=int,
                         help="get rank of the process")
     parser.add_argument("--standalone",
                         action="store_true",
                         help="run in the standalone mode")
-    parser.add_argument(
-        "--pad-data",
-        default=False,
-        action="store_true",
-        help="Pad train nid to the same length across machine, to ensure num "
-        "of batches to be the same.",
-    )
     parser.add_argument("--breakdown", action="store_true")
     args = parser.parse_args()
 

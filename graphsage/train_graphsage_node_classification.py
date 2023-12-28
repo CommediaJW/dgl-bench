@@ -8,14 +8,24 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import dgl
-from models import SAGE, compute_acc, evaluate
+from models import SAGE, compute_acc
 
 import sys
 
 sys.path.append("utils")
-from load_graph import load_ogb, load_reddit
+from load_graph import load_dataset
 
 torch.manual_seed(25)
+
+
+def evaluate(model, g, labels, val_nid, test_nid, batch_size):
+    model.eval()
+    with th.no_grad():
+        pred = model.inference(g, batch_size)
+    model.train()
+    return compute_acc(pred[val_nid],
+                       labels[val_nid]), compute_acc(pred[test_nid],
+                                                     labels[test_nid])
 
 
 def run(rank, world_size, data, args):
