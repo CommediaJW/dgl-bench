@@ -77,12 +77,21 @@ def run(args, device, data):
     loss_fcn = loss_fcn.to(device)
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
 
+    pb = g.get_partition_book()
+    partition_range = [0]
+    for i in range(pb.num_partitions()):
+        partition_range.append(pb._max_node_ids[i])
+    part_id = pb.partid
+
     epoch_time_log = []
     sample_time_log = []
     load_time_log = []
     forward_time_log = []
     backward_time_log = []
     update_time_log = []
+    num_layer_seeds_log = []
+    num_layer_neighbors_log = []
+    num_inputs_log = []
     for epoch in range(args.num_epochs):
 
         sample_time = 0
@@ -93,7 +102,10 @@ def run(args, device, data):
         num_seeds = 0
         num_inputs = 0
         num_iters = 0
+        num_layer_seeds = 0
+        num_layer_neighbors = 0
 
+        model.train()
         with model.join():
             if args.breakdown:
                 dist.barrier()
@@ -112,7 +124,17 @@ def run(args, device, data):
                     g, seeds, input_nodes, "cpu")
                 batch_labels = batch_labels.long()
                 num_seeds += len(blocks[-1].dstdata[dgl.NID])
-                num_inputs += len(blocks[0].srcdata[dgl.NID])
+                for l, block in enumerate(blocks):
+                    layer_seeds = block.dstdata[dgl.NID]
+                    remote_layer_seeds_num = torch.sum(
+                        layer_seeds >= partition_range[
+                            part_id + 1]).item() + torch.sum(
+                                layer_seeds < partition_range[part_id]).item()
+                    num_layer_seeds += remote_layer_seeds_num
+                    num_layer_neighbors += remote_layer_seeds_num * fan_out[l]
+                num_inputs += torch.sum(input_nodes >= partition_range[
+                    part_id + 1]).item() + torch.sum(
+                        input_nodes < partition_range[part_id]).item()
                 blocks = [block.to(device) for block in blocks]
                 batch_inputs = batch_inputs.to(device)
                 batch_labels = batch_labels.to(device)
@@ -181,6 +203,8 @@ def run(args, device, data):
                              "#seeds: {}\n"
                              "#inputs: {}\n"
                              "#iterations: {}\n"
+                             "#sampling_seeds: {}\n"
+                             "#sampled_neighbors: {}\n"
                              "=====================".format(
                                  dist.get_rank(),
                                  epoch_toc - epoch_tic,
@@ -192,6 +216,8 @@ def run(args, device, data):
                                  num_seeds,
                                  num_inputs,
                                  num_iters,
+                                 num_layer_seeds,
+                                 num_layer_neighbors,
                              ))
                 print(timetable)
         sample_time_log.append(sample_time)
@@ -200,6 +226,9 @@ def run(args, device, data):
         backward_time_log.append(backward_time)
         update_time_log.append(update_time)
         epoch_time_log.append(epoch_toc - epoch_tic)
+        num_layer_seeds_log.append(num_layer_seeds)
+        num_layer_neighbors_log.append(num_layer_neighbors)
+        num_inputs_log.append(num_inputs)
 
         if (epoch + 1) % args.eval_every == 0 and epoch != 0:
             start = time.time()
@@ -241,15 +270,16 @@ def run(args, device, data):
                          "Forward Time(s): {:.4f}\n"
                          "Backward Time(s): {:.4f}\n"
                          "Update Time(s): {:.4f}\n"
+                         "#inputs: {}\n"
+                         "#sampling_seeds: {}\n"
+                         "#sampled_neighbors: {}\n"
                          "=====================".format(
-                             dist.get_rank(),
-                             avg_epoch_time,
-                             avg_sample_time,
-                             avg_load_time,
-                             avg_forward_time,
-                             avg_backward_time,
-                             avg_update_time,
-                         ))
+                             dist.get_rank(), avg_epoch_time, avg_sample_time,
+                             avg_load_time, avg_forward_time,
+                             avg_backward_time, avg_update_time,
+                             np.mean(num_inputs_log[2:]),
+                             np.mean(num_layer_seeds_log[2:]),
+                             np.mean(num_layer_neighbors_log[2:])))
             print(timetable)
     all_reduce_tensor = torch.tensor([0], device="cuda", dtype=torch.float32)
 
