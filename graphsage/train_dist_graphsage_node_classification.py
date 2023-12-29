@@ -160,6 +160,11 @@ def run(args, device, data):
                         print("Avg train acc {:.4f}".format(
                             train_acc_tensor[0].item()))
 
+                if args.breakdown:
+                    dist.barrier()
+                    torch.cuda.synchronize()
+                sample_begin = time.time()
+
             epoch_toc = time.time()
 
         for i in range(args.num_trainers):
@@ -307,6 +312,8 @@ def main(args):
     print("rank:", dist.get_rank())
 
     pb = g.get_partition_book()
+    print(g.ndata)
+
     train_nid = dgl.distributed.node_split(g.ndata["train_mask"],
                                            pb,
                                            force_even=True)
@@ -318,6 +325,9 @@ def main(args):
                                               pb,
                                               force_even=True)
     else:
+        g.ndata["labels"] = torch.load(
+            "/home/ubuntu/workspace/partition_dataset/friendster_labels.pt")
+        g.ndata["features"] = g.ndata.pop("feat")
         val_nid = torch.tensor([])
         test_nid = torch.tensor([])
     local_nid = pb.partid2nids(pb.partid).detach().numpy()

@@ -62,6 +62,9 @@ def run(rank, world_size, data, args):
     forward_time_log = []
     backward_time_log = []
     update_time_log = []
+    num_layer_seeds_log = []
+    num_layer_neighbors_log = []
+    num_inputs_log = []
     for epoch in range(args.num_epochs):
 
         sample_time = 0
@@ -72,6 +75,8 @@ def run(rank, world_size, data, args):
         num_seeds = 0
         num_inputs = 0
         num_iters = 0
+        num_layer_seeds = 0
+        num_layer_neighbors = 0
 
         if args.breakdown:
             dist.barrier()
@@ -92,6 +97,10 @@ def run(rank, world_size, data, args):
             batch_labels = batch_labels.long()
             num_seeds += len(blocks[-1].dstdata[dgl.NID])
             num_inputs += len(blocks[0].srcdata[dgl.NID])
+            for l, block in enumerate(blocks):
+                num_layer_seeds += block.dstdata[dgl.NID].shape[0]
+                num_layer_neighbors += block.dstdata[
+                    dgl.NID].shape[0] * fan_out[l]
             if args.breakdown:
                 dist.barrier()
                 torch.cuda.synchronize()
@@ -155,6 +164,8 @@ def run(rank, world_size, data, args):
                              "#seeds: {}\n"
                              "#inputs: {}\n"
                              "#iterations: {}\n"
+                             "#sampling_seeds: {}\n"
+                             "#sampled_neighbors: {}\n"
                              "=====================".format(
                                  rank,
                                  epoch_toc - epoch_tic,
@@ -166,6 +177,8 @@ def run(rank, world_size, data, args):
                                  num_seeds,
                                  num_inputs,
                                  num_iters,
+                                 num_layer_seeds,
+                                 num_layer_neighbors,
                              ))
                 print(timetable)
         sample_time_log.append(sample_time)
@@ -174,6 +187,9 @@ def run(rank, world_size, data, args):
         backward_time_log.append(backward_time)
         update_time_log.append(update_time)
         epoch_time_log.append(epoch_toc - epoch_tic)
+        num_layer_seeds_log.append(num_layer_seeds)
+        num_layer_neighbors_log.append(num_layer_neighbors)
+        num_inputs_log.append(num_inputs)
 
         if (epoch + 1) % args.eval_every == 0:
             tic = time.time()
@@ -213,15 +229,16 @@ def run(rank, world_size, data, args):
                          "Forward Time(s): {:.4f}\n"
                          "Backward Time(s): {:.4f}\n"
                          "Update Time(s): {:.4f}\n"
+                         "#inputs: {}\n"
+                         "#sampling_seeds: {}\n"
+                         "#sampled_neighbors: {}\n"
                          "=====================".format(
-                             rank,
-                             avg_epoch_time,
-                             avg_sample_time,
-                             avg_load_time,
-                             avg_forward_time,
-                             avg_backward_time,
-                             avg_update_time,
-                         ))
+                             rank, avg_epoch_time, avg_sample_time,
+                             avg_load_time, avg_forward_time,
+                             avg_backward_time, avg_update_time,
+                             np.mean(num_inputs_log[2:]),
+                             np.mean(num_layer_seeds_log[2:]),
+                             np.mean(num_layer_neighbors_log[2:])))
             print(timetable)
     all_reduce_tensor = torch.tensor([0], device="cuda", dtype=torch.float32)
 
