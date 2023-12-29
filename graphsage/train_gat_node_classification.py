@@ -304,10 +304,10 @@ def main(args):
         with_valid = True
         with_test = True
         feat_dtype = torch.float16
-    if args.dataset == "ogbn-papers100M":
+    elif args.dataset == "ogbn-papers100M":
         with_feature = False
-        with_valid = False
-        with_test = False
+        with_valid = True
+        with_test = True
         feat_dtype = torch.float32
     else:
         with_feature = True
