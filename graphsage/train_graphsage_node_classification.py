@@ -135,6 +135,11 @@ def run(rank, world_size, data, args):
                     print("Avg train acc {:.4f}".format(
                         train_acc_tensor[0].item()))
 
+            if args.breakdown:
+                dist.barrier()
+                torch.cuda.synchronize()
+            sample_begin = time.time()
+
         epoch_toc = time.time()
 
         for i in range(args.num_trainers):
