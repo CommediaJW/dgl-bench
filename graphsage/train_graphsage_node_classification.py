@@ -9,18 +9,15 @@ import torch.nn.functional as F
 import torch.optim as optim
 import dgl
 from models import SAGE, compute_acc
-
-import sys
-
-sys.path.append("utils")
-from load_graph import load_dataset
+import bifeat
+import os
 
 torch.manual_seed(25)
 
 
 def evaluate(model, g, labels, val_nid, test_nid, batch_size):
     model.eval()
-    with th.no_grad():
+    with torch.no_grad():
         pred = model.inference(g, batch_size)
     model.train()
     return compute_acc(pred[val_nid],
@@ -29,12 +26,7 @@ def evaluate(model, g, labels, val_nid, test_nid, batch_size):
 
 
 def run(rank, world_size, data, args):
-    torch.cuda.set_device(rank)
-    device = torch.device("cuda")
-    dist.init_process_group('nccl',
-                            'tcp://127.0.0.1:12347',
-                            world_size=world_size,
-                            rank=rank)
+    device = torch.cuda.current_device()
     # Unpack data
     train_nid, val_nid, test_nid, n_classes, g = data
     fan_out = [int(fanout) for fanout in args.fan_out.split(",")]
@@ -275,6 +267,21 @@ def run(rank, world_size, data, args):
 
 
 def main(args):
+    dist.init_process_group(backend="nccl")
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    assert world_size == args.num_trainers
+    omp_thread_num = os.cpu_count() // args.num_trainers
+    torch.cuda.set_device(rank)
+    torch.set_num_threads(omp_thread_num)
+    print("Set device to {} and cpu threads num {}".format(
+        rank, omp_thread_num))
+    shm_manager = bifeat.shm.ShmManager(rank,
+                                        args.num_trainers,
+                                        args.root,
+                                        args.dataset,
+                                        pin_memory=False)
+
     if args.dataset == "friendster":
         with_feature = False
         with_valid = False
@@ -285,23 +292,37 @@ def main(args):
         with_valid = True
         with_test = True
         feat_dtype = torch.float16
+    if args.dataset == "ogbn-papers100M":
+        with_feature = False
+        with_valid = False
+        with_test = False
+        feat_dtype = torch.float32
     else:
         with_feature = True
         with_valid = True
         with_test = True
-    g, metadata = load_dataset(args.root,
-                               args.dataset,
-                               with_feature=with_feature,
-                               with_test=with_test,
-                               with_valid=with_valid)
+    g, metadata = shm_manager.load_dataset(with_feature=with_feature,
+                                           with_test=with_test,
+                                           with_valid=with_valid)
     dgl_g = dgl.graph(('csc', (g["indptr"], g["indices"], torch.tensor([]))))
     dgl_g.ndata["labels"] = g["labels"]
     if with_feature:
         dgl_g.ndata["features"] = g["features"]
     else:
-        dgl_g.ndata["features"] = torch.randn(
-            (metadata["num_nodes"], ),
-            dtype=feat_dtype).reshape(-1, 1).repeat(1, metadata["feature_dim"])
+        if shm_manager._is_chief:
+            fake_feat = torch.randn(
+                (metadata["num_nodes"], ),
+                dtype=feat_dtype).reshape(-1,
+                                          1).repeat(1, metadata["feature_dim"])
+            g["features"] = shm_manager.create_shm_tensor(
+                args.dataset + "_shm_features", feat_dtype, fake_feat.shape)
+            g["features"].copy_(fake_feat)
+            del fake_feat
+        else:
+            g["features"] = shm_manager.create_shm_tensor(
+                args.dataset + "_shm_features", None, None)
+    dist.barrier()
+    dgl_g.ndata["features"] = g["features"]
     train_nid = g["train_idx"]
     if with_valid:
         val_nid = g["valid_idx"]
@@ -311,16 +332,10 @@ def main(args):
         test_nid = g["test_idx"]
     else:
         test_nid = torch.tensor([]).long()
-
+    print("start")
     data = train_nid, val_nid, test_nid, metadata["num_classes"], dgl_g
 
-    num_trainers_list = args.num_trainers.split(",")
-    for num_trainers in num_trainers_list:
-        args.num_trainers = int(num_trainers)
-        import torch.multiprocessing as mp
-        mp.spawn(run,
-                 args=(args.num_trainers, data, args),
-                 nprocs=args.num_trainers)
+    run(rank, world_size, data, args)
 
 
 if __name__ == "__main__":
@@ -335,8 +350,8 @@ if __name__ == "__main__":
     argparser.add_argument("--root", type=str, default="/data")
     argparser.add_argument(
         "--num-trainers",
-        type=str,
-        default="1,2,4,8",
+        type=int,
+        default="8",
         help=
         "number of trainers participated in the compress, no greater than available GPUs num"
     )
