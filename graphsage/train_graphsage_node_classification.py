@@ -79,7 +79,7 @@ def run(rank, world_size, data, args):
         num_layer_neighbors = 0
 
         if args.breakdown:
-            dist.barrier()
+            # dist.barrier()
             torch.cuda.synchronize()
         epoch_tic = time.time()
         sample_begin = time.time()
@@ -87,7 +87,7 @@ def run(rank, world_size, data, args):
         for step, (input_nodes, seeds, blocks) in enumerate(dataloader):
             num_iters += 1
             if args.breakdown:
-                dist.barrier()
+                # dist.barrier()
                 torch.cuda.synchronize()
             sample_time += time.time() - sample_begin
 
@@ -102,7 +102,7 @@ def run(rank, world_size, data, args):
                 num_layer_neighbors += block.dstdata[
                     dgl.NID].shape[0] * fan_out[l]
             if args.breakdown:
-                dist.barrier()
+                # dist.barrier()
                 torch.cuda.synchronize()
             load_time += time.time() - load_begin
 
@@ -110,7 +110,7 @@ def run(rank, world_size, data, args):
             batch_pred = model(blocks, batch_inputs)
             loss = loss_fcn(batch_pred, batch_labels)
             if args.breakdown:
-                dist.barrier()
+                # dist.barrier()
                 torch.cuda.synchronize()
             forward_time += time.time() - forward_start
 
@@ -118,14 +118,14 @@ def run(rank, world_size, data, args):
             optimizer.zero_grad()
             loss.backward()
             if args.breakdown:
-                dist.barrier()
+                # dist.barrier()
                 torch.cuda.synchronize()
             backward_time += time.time() - backward_begin
 
             update_start = time.time()
             optimizer.step()
             if args.breakdown:
-                dist.barrier()
+                # dist.barrier()
                 torch.cuda.synchronize()
             update_time += time.time() - update_start
 
@@ -145,7 +145,7 @@ def run(rank, world_size, data, args):
                         train_acc_tensor[0].item()))
 
             if args.breakdown:
-                dist.barrier()
+                # dist.barrier()
                 torch.cuda.synchronize()
             sample_begin = time.time()
 
