@@ -347,8 +347,15 @@ def main(args):
     train_nid = dgl.distributed.node_split(g.ndata["train_mask"],
                                            pb,
                                            force_even=True)
-    if args.graph_name != "friendster":
+    if args.graph_name == "ogb-products" or args.DistGraph == "ogb-paper100M":
         val_nid = dgl.distributed.node_split(g.ndata["val_mask"],
+                                             pb,
+                                             force_even=True)
+        test_nid = dgl.distributed.node_split(g.ndata["test_mask"],
+                                              pb,
+                                              force_even=True)
+    elif args.graph_name == "mag240m":
+        val_nid = dgl.distributed.node_split(g.ndata["valid_mask"],
                                              pb,
                                              force_even=True)
         test_nid = dgl.distributed.node_split(g.ndata["test_mask"],
