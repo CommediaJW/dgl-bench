@@ -8,9 +8,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import dgl
-from models import GAT, compute_acc
+from models import SAGE, GAT
 import bifeat
 import os
+from common import evaluate_nodeclass, compute_acc
 
 torch.manual_seed(25)
 
@@ -29,6 +30,24 @@ def run(rank, world_size, data, args):
     device = torch.cuda.current_device()
     # Unpack data
     train_nid, val_nid, test_nid, n_classes, g = data
+    if args.infer_method == "node":
+        local_val_num = (val_nid.shape[0] + dist.get_world_size() -
+                         1) // dist.get_world_size()
+        if dist.get_rank() == dist.get_world_size() - 1:
+            local_val_nid = val_nid[local_val_num * dist.get_rank():]
+        else:
+            local_val_nid = val_nid[local_val_num *
+                                    dist.get_rank():local_val_num *
+                                    (dist.get_rank() + 1)]
+        local_test_num = (test_nid.shape[0] + dist.get_world_size() -
+                          1) // dist.get_world_size()
+        if dist.get_rank() == dist.get_world_size() - 1:
+            local_test_nid = test_nid[local_test_num * dist.get_rank():]
+        else:
+            local_test_nid = test_nid[local_test_num *
+                                      dist.get_rank():local_test_num *
+                                      (dist.get_rank() + 1)]
+
     fan_out = [int(fanout) for fanout in args.fan_out.split(",")]
     sampler = dgl.dataloading.NeighborSampler(
         fan_out,
@@ -36,7 +55,7 @@ def run(rank, world_size, data, args):
         prefetch_labels=["labels"],
     )
     dataloader = dgl.dataloading.DataLoader(g,
-                                            train_nid,
+                                            train_nid.cuda(),
                                             sampler,
                                             device=device,
                                             batch_size=args.batch_size,
@@ -44,17 +63,22 @@ def run(rank, world_size, data, args):
                                             drop_last=False,
                                             num_workers=0,
                                             use_ddp=True,
-                                            use_uva=True)
+                                            use_uva=False)
     # Define model and optimizer
-    gat_heads = [int(head) for head in args.heads.split(",")]
-    model = GAT(g.ndata["features"].shape[1],
-                args.num_hidden,
-                n_classes,
-                len(fan_out),
-                gat_heads,
-                activation=F.relu,
-                feat_dropout=args.feat_dropout,
-                attn_dropout=args.attn_dropout)
+    if args.model == "sage":
+        model = SAGE(g.ndata["features"].shape[1], args.num_hidden, n_classes,
+                     len(fan_out), F.relu, args.dropout)
+    elif args.model == "gat":
+        heads = [args.num_heads for _ in range(len(fan_out) - 1)]
+        heads.append(1)
+        model = GAT(g.ndata["features"].shape[1],
+                    args.num_hidden // args.num_heads,
+                    n_classes,
+                    len(fan_out),
+                    heads,
+                    activation=F.relu,
+                    feat_dropout=args.dropout,
+                    attn_dropout=args.dropout)
     model = model.to(device)
     model = nn.parallel.DistributedDataParallel(model,
                                                 device_ids=[rank],
@@ -69,6 +93,9 @@ def run(rank, world_size, data, args):
     forward_time_log = []
     backward_time_log = []
     update_time_log = []
+    num_layer_seeds_log = []
+    num_layer_neighbors_log = []
+    num_inputs_log = []
     for epoch in range(args.num_epochs):
 
         sample_time = 0
@@ -79,6 +106,8 @@ def run(rank, world_size, data, args):
         num_seeds = 0
         num_inputs = 0
         num_iters = 0
+        num_layer_seeds = 0
+        num_layer_neighbors = 0
 
         if args.breakdown:
             # dist.barrier()
@@ -99,6 +128,10 @@ def run(rank, world_size, data, args):
             batch_labels = batch_labels.long()
             num_seeds += len(blocks[-1].dstdata[dgl.NID])
             num_inputs += len(blocks[0].srcdata[dgl.NID])
+            for l, block in enumerate(blocks):
+                num_layer_seeds += block.dstdata[dgl.NID].shape[0]
+                num_layer_neighbors += block.dstdata[
+                    dgl.NID].shape[0] * fan_out[l]
             if args.breakdown:
                 # dist.barrier()
                 torch.cuda.synchronize()
@@ -162,6 +195,8 @@ def run(rank, world_size, data, args):
                              "#seeds: {}\n"
                              "#inputs: {}\n"
                              "#iterations: {}\n"
+                             "#sampling_seeds: {}\n"
+                             "#sampled_neighbors: {}\n"
                              "=====================".format(
                                  rank,
                                  epoch_toc - epoch_tic,
@@ -173,6 +208,8 @@ def run(rank, world_size, data, args):
                                  num_seeds,
                                  num_inputs,
                                  num_iters,
+                                 num_layer_seeds,
+                                 num_layer_neighbors,
                              ))
                 print(timetable)
         sample_time_log.append(sample_time)
@@ -181,26 +218,39 @@ def run(rank, world_size, data, args):
         backward_time_log.append(backward_time)
         update_time_log.append(update_time)
         epoch_time_log.append(epoch_toc - epoch_tic)
+        num_layer_seeds_log.append(num_layer_seeds)
+        num_layer_neighbors_log.append(num_layer_neighbors)
+        num_inputs_log.append(num_inputs)
 
         if (epoch + 1) % args.eval_every == 0:
-            tic = time.time()
-            val_acc, test_acc = evaluate(
-                model.module,
-                g,
-                g.ndata["labels"],
-                val_nid,
-                test_nid,
-                args.batch_size_eval,
-            )
-            print("Part {}, Val Acc {:.4f}, Test Acc {:.4f}, time: {:.4f}".
-                  format(rank, val_acc, test_acc,
-                         time.time() - tic))
-            acc_tensor = torch.tensor([val_acc, test_acc]).cuda()
-            dist.all_reduce(acc_tensor, dist.ReduceOp.SUM)
-            acc_tensor /= world_size
-            if rank == 0:
-                print("All parts avg val acc {:.4f}, test acc {:.4f}".format(
-                    acc_tensor[0].item(), acc_tensor[1].item()))
+            if args.infer_method == "node":
+                tic = time.time()
+                val_acc, test_acc = evaluate_nodeclass(args, g, model,
+                                                       g.ndata["features"],
+                                                       g.ndata["labels"],
+                                                       local_val_nid,
+                                                       local_test_nid)
+                print("Part {}, Val Acc {:.4f}, Test Acc {:.4f}, time: {:.4f}".
+                      format(rank, val_acc, test_acc,
+                             time.time() - tic))
+                acc_tensor = torch.tensor([val_acc, test_acc]).cuda()
+                dist.all_reduce(acc_tensor, dist.ReduceOp.SUM)
+                acc_tensor /= world_size
+                if rank == 0:
+                    print(
+                        "All parts avg val acc {:.4f}, test acc {:.4f}".format(
+                            acc_tensor[0].item(), acc_tensor[1].item()))
+            else:
+                if dist.get_rank() == 0:
+                    tic = time.time()
+                    val_acc, test_acc = evaluate_nodeclass(
+                        args, g, model, g.ndata["features"], g.ndata["labels"],
+                        val_nid, test_nid)
+                    print(
+                        "All parts avg val acc {:.4f}, test acc {:.4f}, time: {:.4f}"
+                        .format(rank, val_acc, test_acc,
+                                time.time() - tic))
+                dist.barrier()
 
     avg_epoch_time = np.mean(epoch_time_log[2:])
     avg_sample_time = np.mean(sample_time_log[2:])
@@ -220,15 +270,16 @@ def run(rank, world_size, data, args):
                          "Forward Time(s): {:.4f}\n"
                          "Backward Time(s): {:.4f}\n"
                          "Update Time(s): {:.4f}\n"
+                         "#inputs: {}\n"
+                         "#sampling_seeds: {}\n"
+                         "#sampled_neighbors: {}\n"
                          "=====================".format(
-                             rank,
-                             avg_epoch_time,
-                             avg_sample_time,
-                             avg_load_time,
-                             avg_forward_time,
-                             avg_backward_time,
-                             avg_update_time,
-                         ))
+                             rank, avg_epoch_time, avg_sample_time,
+                             avg_load_time, avg_forward_time,
+                             avg_backward_time, avg_update_time,
+                             np.mean(num_inputs_log[2:]),
+                             np.mean(num_layer_seeds_log[2:]),
+                             np.mean(num_layer_neighbors_log[2:])))
             print(timetable)
     all_reduce_tensor = torch.tensor([0], device="cuda", dtype=torch.float32)
 
@@ -293,7 +344,6 @@ def main(args):
                                         args.root,
                                         args.dataset,
                                         pin_memory=False)
-
     if args.dataset == "friendster":
         with_feature = False
         with_valid = False
@@ -305,7 +355,7 @@ def main(args):
         with_test = True
         feat_dtype = torch.float16
     elif args.dataset == "ogbn-papers100M":
-        with_feature = False
+        with_feature = True
         with_valid = True
         with_test = True
         feat_dtype = torch.float32
@@ -344,6 +394,7 @@ def main(args):
         test_nid = g["test_idx"]
     else:
         test_nid = torch.tensor([]).long()
+    dgl_g = dgl_g.to("cuda")
     print("start")
     data = train_nid, val_nid, test_nid, metadata["num_classes"], dgl_g
 
@@ -368,17 +419,24 @@ if __name__ == "__main__":
         "number of trainers participated in the compress, no greater than available GPUs num"
     )
     argparser.add_argument("--lr", type=float, default=0.003)
+    argparser.add_argument("--dropout", type=float, default=0.2)
     argparser.add_argument("--batch-size", type=int, default=1000)
-    argparser.add_argument("--batch-size-eval", type=int, default=100000)
+    argparser.add_argument("--batch-size-eval", type=int, default=1000)
     argparser.add_argument("--log-every", type=int, default=20)
     argparser.add_argument("--eval-every", type=int, default=5)
     argparser.add_argument("--fan-out", type=str, default="5,10,15")
-    argparser.add_argument("--num-hidden", type=int, default=32)
-    argparser.add_argument("--heads", type=str, default="8,8,1")
-    argparser.add_argument("--feat_dropout", type=float, default=0.2)
-    argparser.add_argument("--attn_dropout", type=float, default=0.2)
+    argparser.add_argument("--model",
+                           type=str,
+                           default="sage",
+                           choices=["sage", "gat"])
+    argparser.add_argument("--num-hidden", type=int, default=256)
+    argparser.add_argument("--num-heads", type=int, default=8)
     argparser.add_argument("--num-epochs", type=int, default=20)
     argparser.add_argument("--breakdown", action="store_true", default=False)
+    argparser.add_argument("--infer-method",
+                           type=str,
+                           default="node",
+                           choices=["node", "layer"])
     args = argparser.parse_args()
     print(args)
     main(args)

@@ -8,9 +8,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import dgl
-from models import SAGE, compute_acc
+from models import SAGE, GAT
 import bifeat
 import os
+from common import evaluate_nodeclass, compute_acc
 
 torch.manual_seed(25)
 
@@ -29,6 +30,24 @@ def run(rank, world_size, data, args):
     device = torch.cuda.current_device()
     # Unpack data
     train_nid, val_nid, test_nid, n_classes, g = data
+    if args.infer_method == "node":
+        local_val_num = (val_nid.shape[0] + dist.get_world_size() -
+                         1) // dist.get_world_size()
+        if dist.get_rank() == dist.get_world_size() - 1:
+            local_val_nid = val_nid[local_val_num * dist.get_rank():]
+        else:
+            local_val_nid = val_nid[local_val_num *
+                                    dist.get_rank():local_val_num *
+                                    (dist.get_rank() + 1)]
+        local_test_num = (test_nid.shape[0] + dist.get_world_size() -
+                          1) // dist.get_world_size()
+        if dist.get_rank() == dist.get_world_size() - 1:
+            local_test_nid = test_nid[local_test_num * dist.get_rank():]
+        else:
+            local_test_nid = test_nid[local_test_num *
+                                      dist.get_rank():local_test_num *
+                                      (dist.get_rank() + 1)]
+
     fan_out = [int(fanout) for fanout in args.fan_out.split(",")]
     sampler = dgl.dataloading.NeighborSampler(
         fan_out,
@@ -46,8 +65,20 @@ def run(rank, world_size, data, args):
                                             use_ddp=True,
                                             use_uva=True)
     # Define model and optimizer
-    model = SAGE(g.ndata["features"].shape[1], args.num_hidden, n_classes,
-                 len(fan_out), F.relu, args.dropout)
+    if args.model == "sage":
+        model = SAGE(g.ndata["features"].shape[1], args.num_hidden, n_classes,
+                     len(fan_out), F.relu, args.dropout)
+    elif args.model == "gat":
+        heads = [args.num_heads for _ in range(len(fan_out) - 1)]
+        heads.append(1)
+        model = GAT(g.ndata["features"].shape[1],
+                    args.num_hidden // args.num_heads,
+                    n_classes,
+                    len(fan_out),
+                    heads,
+                    activation=F.relu,
+                    feat_dropout=args.dropout,
+                    attn_dropout=args.dropout)
     model = model.to(device)
     model = nn.parallel.DistributedDataParallel(model,
                                                 device_ids=[rank],
@@ -192,24 +223,34 @@ def run(rank, world_size, data, args):
         num_inputs_log.append(num_inputs)
 
         if (epoch + 1) % args.eval_every == 0:
-            tic = time.time()
-            val_acc, test_acc = evaluate(
-                model.module,
-                g,
-                g.ndata["labels"],
-                val_nid,
-                test_nid,
-                args.batch_size_eval,
-            )
-            print("Part {}, Val Acc {:.4f}, Test Acc {:.4f}, time: {:.4f}".
-                  format(rank, val_acc, test_acc,
-                         time.time() - tic))
-            acc_tensor = torch.tensor([val_acc, test_acc]).cuda()
-            dist.all_reduce(acc_tensor, dist.ReduceOp.SUM)
-            acc_tensor /= world_size
-            if rank == 0:
-                print("All parts avg val acc {:.4f}, test acc {:.4f}".format(
-                    acc_tensor[0].item(), acc_tensor[1].item()))
+            if args.infer_method == "node":
+                tic = time.time()
+                val_acc, test_acc = evaluate_nodeclass(args, g, model,
+                                                       g.ndata["features"],
+                                                       g.ndata["labels"],
+                                                       local_val_nid,
+                                                       local_test_nid)
+                print("Part {}, Val Acc {:.4f}, Test Acc {:.4f}, time: {:.4f}".
+                      format(rank, val_acc, test_acc,
+                             time.time() - tic))
+                acc_tensor = torch.tensor([val_acc, test_acc]).cuda()
+                dist.all_reduce(acc_tensor, dist.ReduceOp.SUM)
+                acc_tensor /= world_size
+                if rank == 0:
+                    print(
+                        "All parts avg val acc {:.4f}, test acc {:.4f}".format(
+                            acc_tensor[0].item(), acc_tensor[1].item()))
+            else:
+                if dist.get_rank() == 0:
+                    tic = time.time()
+                    val_acc, test_acc = evaluate_nodeclass(
+                        args, g, model, g.ndata["features"], g.ndata["labels"],
+                        val_nid, test_nid)
+                    print(
+                        "All parts avg val acc {:.4f}, test acc {:.4f}, time: {:.4f}"
+                        .format(rank, val_acc, test_acc,
+                                time.time() - tic))
+                dist.barrier()
 
     avg_epoch_time = np.mean(epoch_time_log[2:])
     avg_sample_time = np.mean(sample_time_log[2:])
@@ -314,7 +355,7 @@ def main(args):
         with_test = True
         feat_dtype = torch.float16
     elif args.dataset == "ogbn-papers100M":
-        with_feature = False
+        with_feature = True
         with_valid = True
         with_test = True
         feat_dtype = torch.float32
@@ -379,13 +420,22 @@ if __name__ == "__main__":
     argparser.add_argument("--lr", type=float, default=0.003)
     argparser.add_argument("--dropout", type=float, default=0.2)
     argparser.add_argument("--batch-size", type=int, default=1000)
-    argparser.add_argument("--batch-size-eval", type=int, default=100000)
+    argparser.add_argument("--batch-size-eval", type=int, default=1000)
     argparser.add_argument("--log-every", type=int, default=20)
     argparser.add_argument("--eval-every", type=int, default=5)
     argparser.add_argument("--fan-out", type=str, default="5,10,15")
+    argparser.add_argument("--model",
+                           type=str,
+                           default="sage",
+                           choices=["sage", "gat"])
     argparser.add_argument("--num-hidden", type=int, default=256)
+    argparser.add_argument("--num-heads", type=int, default=8)
     argparser.add_argument("--num-epochs", type=int, default=20)
     argparser.add_argument("--breakdown", action="store_true", default=False)
+    argparser.add_argument("--infer-method",
+                           type=str,
+                           default="node",
+                           choices=["node", "layer"])
     args = argparser.parse_args()
     print(args)
     main(args)

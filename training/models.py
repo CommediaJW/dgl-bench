@@ -14,6 +14,8 @@ from dgl.dataloading import (
     MultiLayerFullNeighborSampler,
 )
 
+DEFAULT_NUM_PICKS = 15
+
 
 class SAGE(nn.Module):
 
@@ -40,9 +42,30 @@ class SAGE(nn.Module):
                 h = self.dropout(h)
         return h
 
-    def inference(self, g, batch_size):
-        """Conduct layer-wise inference to get all the node embeddings."""
-        feature = g.ndata["features"]
+    def nodewise_inference(self, g, feature, seeds, batch_size):
+        result = th.empty((seeds.numel(), self.n_classes), dtype=th.float)
+        result_map = th.full((g.num_nodes(), ), -1, dtype=th.int64)
+        result_map[seeds] = th.arange(0, seeds.numel())
+        sampler = dgl.dataloading.NeighborSampler(
+            [DEFAULT_NUM_PICKS for _ in range(self.n_layers)])
+        dataloader = DataLoader(g,
+                                seeds.cuda(),
+                                sampler,
+                                device="cuda",
+                                batch_size=batch_size,
+                                shuffle=False,
+                                drop_last=False,
+                                num_workers=0,
+                                use_uva=True)
+        for input_nodes, output_nodes, blocks in tqdm.tqdm(dataloader):
+            blocks = [block.to("cuda") for block in blocks]
+            batch_inputs = feature[input_nodes.cpu()].to("cuda")
+            pred = self.forward(blocks, batch_inputs).to("cpu")
+            result[result_map[output_nodes.cpu()]] = pred
+
+        return result, result_map
+
+    def layerwise_inference(self, g, feature, batch_size):
         sampler = MultiLayerFullNeighborSampler(1)
         dataloader = DataLoader(g,
                                 th.arange(g.num_nodes()).cuda(),
@@ -114,7 +137,30 @@ class GAT(nn.Module):
                 h = h.flatten(1)
         return h
 
-    def inference(self, g, batch_size):
+    def nodewise_inference(self, g, feature, seeds, batch_size):
+        result = th.empty((seeds.numel(), self.n_classes), dtype=th.float)
+        result_map = th.full((g.num_nodes(), ), -1, dtype=th.int64)
+        result_map[seeds] = th.arange(0, seeds.numel())
+        sampler = dgl.dataloading.NeighborSampler(
+            [DEFAULT_NUM_PICKS for _ in range(self.n_layers)])
+        dataloader = DataLoader(g,
+                                seeds.cuda(),
+                                sampler,
+                                device="cuda",
+                                batch_size=batch_size,
+                                shuffle=False,
+                                drop_last=False,
+                                num_workers=0,
+                                use_uva=True)
+        for input_nodes, output_nodes, blocks in tqdm.tqdm(dataloader):
+            blocks = [block.to("cuda") for block in blocks]
+            batch_inputs = feature[input_nodes.cpu()].to("cuda")
+            pred = self.forward(blocks, batch_inputs).to("cpu")
+            result[result_map[output_nodes.cpu()]] = pred
+
+        return result, result_map
+
+    def layerwise_inference(self, g, batch_size):
         """Conduct layer-wise inference to get all the node embeddings."""
         feature = g.ndata["features"]
         sampler = MultiLayerFullNeighborSampler(1)
