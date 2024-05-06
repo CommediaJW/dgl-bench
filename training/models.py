@@ -4,8 +4,10 @@ import dgl
 import dgl.nn.pytorch as dglnn
 
 import numpy as np
+import torch
 import torch as th
 import torch.nn as nn
+import torch.distributed as dist
 import tqdm
 
 import torch.nn.functional as F
@@ -42,56 +44,6 @@ class SAGE(nn.Module):
                 h = self.dropout(h)
         return h
 
-    def nodewise_inference(self, g, feature, seeds, batch_size):
-        result = th.empty((seeds.numel(), self.n_classes), dtype=th.float)
-        result_map = th.full((g.num_nodes(), ), -1, dtype=th.int64)
-        result_map[seeds] = th.arange(0, seeds.numel())
-        sampler = dgl.dataloading.NeighborSampler(
-            [DEFAULT_NUM_PICKS for _ in range(self.n_layers)])
-        dataloader = DataLoader(g,
-                                seeds.cuda(),
-                                sampler,
-                                device="cuda",
-                                batch_size=batch_size,
-                                shuffle=False,
-                                drop_last=False,
-                                num_workers=0,
-                                use_uva=True)
-        for input_nodes, output_nodes, blocks in tqdm.tqdm(dataloader):
-            blocks = [block.to("cuda") for block in blocks]
-            batch_inputs = feature[input_nodes.cpu()].to("cuda")
-            pred = self.forward(blocks, batch_inputs).to("cpu")
-            result[result_map[output_nodes.cpu()]] = pred
-
-        return result, result_map
-
-    def layerwise_inference(self, g, feature, batch_size):
-        sampler = MultiLayerFullNeighborSampler(1)
-        dataloader = DataLoader(g,
-                                th.arange(g.num_nodes()).cuda(),
-                                sampler,
-                                device="cuda",
-                                batch_size=batch_size,
-                                shuffle=False,
-                                drop_last=False,
-                                num_workers=0,
-                                use_uva=True)
-
-        for l, layer in enumerate(self.layers):
-            y = th.empty(g.num_nodes(),
-                         self.n_hidden if l != len(self.layers) -
-                         1 else self.n_classes,
-                         dtype=feature.dtype)
-            for input_nodes, output_nodes, blocks in tqdm.tqdm(dataloader):
-                x = feature[input_nodes.cpu()].cuda()
-                h = layer(blocks[0], x)
-                if l != len(self.layers) - 1:
-                    h = self.activation(h)
-                    h = self.dropout(h)
-                y[output_nodes] = h.to("cpu")
-            feature = y
-        return y
-
 
 class GAT(nn.Module):
 
@@ -101,9 +53,8 @@ class GAT(nn.Module):
                  n_classes,
                  n_layers,
                  n_heads,
-                 activation=F.relu,
-                 feat_dropout=0.6,
-                 attn_dropout=0.6):
+                 activation=F.elu,
+                 dropout=0.5):
         assert len(n_heads) == n_layers
         assert n_heads[-1] == 1
 
@@ -117,15 +68,13 @@ class GAT(nn.Module):
         for i in range(0, n_layers):
             in_dim = in_feats if i == 0 else n_hidden * n_heads[i - 1]
             out_dim = n_classes if i == n_layers - 1 else n_hidden
-            layer_activation = None if i == n_layers - 1 else activation
             self.layers.append(
                 dglnn.GATConv(in_dim,
                               out_dim,
                               n_heads[i],
-                              feat_drop=feat_dropout,
-                              attn_drop=attn_dropout,
-                              activation=layer_activation,
                               allow_zero_in_degree=True))
+        self.dropout = nn.Dropout(dropout)
+        self.activation = activation
 
     def forward(self, blocks, x):
         h = x
@@ -134,65 +83,28 @@ class GAT(nn.Module):
             if i == self.n_layers - 1:
                 h = h.mean(1)
             else:
+                h = self.activation(h)
+                h = self.dropout(h)
                 h = h.flatten(1)
         return h
 
-    def nodewise_inference(self, g, feature, seeds, batch_size):
-        result = th.empty((seeds.numel(), self.n_classes), dtype=th.float)
-        result_map = th.full((g.num_nodes(), ), -1, dtype=th.int64)
-        result_map[seeds] = th.arange(0, seeds.numel())
-        sampler = dgl.dataloading.NeighborSampler(
-            [DEFAULT_NUM_PICKS for _ in range(self.n_layers)])
-        dataloader = DataLoader(g,
-                                seeds.cuda(),
-                                sampler,
-                                device="cuda",
-                                batch_size=batch_size,
-                                shuffle=False,
-                                drop_last=False,
-                                num_workers=0,
-                                use_uva=True)
-        for input_nodes, output_nodes, blocks in tqdm.tqdm(dataloader):
-            blocks = [block.to("cuda") for block in blocks]
-            batch_inputs = feature[input_nodes.cpu()].to("cuda")
-            pred = self.forward(blocks, batch_inputs).to("cpu")
-            result[result_map[output_nodes.cpu()]] = pred
 
-        return result, result_map
-
-    def layerwise_inference(self, g, batch_size):
-        """Conduct layer-wise inference to get all the node embeddings."""
-        feature = g.ndata["features"]
-        sampler = MultiLayerFullNeighborSampler(1)
-        dataloader = DataLoader(g,
-                                th.arange(g.num_nodes()).cuda(),
-                                sampler,
-                                device="cuda",
-                                batch_size=batch_size,
-                                shuffle=False,
-                                drop_last=False,
-                                num_workers=0,
-                                use_uva=True)
-
-        for l, layer in enumerate(self.layers):
-            if l == len(self.layers) - 1:
-                y = th.empty(g.num_nodes(),
-                             self.n_classes * self.n_heads[l],
-                             dtype=th.float32)
-            else:
-                y = th.empty(g.num_nodes(),
-                             self.n_hidden * self.n_heads[l],
-                             dtype=th.float32)
-            for input_nodes, output_nodes, blocks in tqdm.tqdm(dataloader):
-                x = feature[input_nodes.cpu()].cuda()
-                h = layer(blocks[0], x)
-                if l == self.n_layers - 1:
-                    h = h.mean(1)
-                else:
-                    h = h.flatten(1)
-                y[output_nodes] = h.to("cpu")
-            feature = y
-        return y
+def nodewise_inference(model, dataloader, labels, device="cuda"):
+    model.eval()
+    with torch.no_grad():
+        acc = 0
+        length = 0
+        for input_nodes, output_nodes, blocks in tqdm.tqdm(
+                dataloader, disable=dist.get_rank() != 0):
+            input_nodes = input_nodes.to(device)
+            output_nodes = output_nodes.to(device)
+            blocks = [block.to(device) for block in blocks]
+            batch_inputs = blocks[0].srcdata["features"]
+            pred = model(blocks, batch_inputs).cpu()
+            output_labels = labels[output_nodes.cpu()]
+            acc += (torch.argmax(pred, dim=1) == output_labels).float().sum()
+            length += output_nodes.numel()
+        return acc / length
 
 
 class DistSAGE(nn.Module):

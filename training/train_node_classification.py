@@ -8,7 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import dgl
-from models import SAGE, GAT
+from models import SAGE, GAT, nodewise_inference
 import bifeat
 import os
 from common import evaluate_nodeclass, compute_acc
@@ -64,21 +64,38 @@ def run(rank, world_size, data, args):
                                             num_workers=0,
                                             use_ddp=True,
                                             use_uva=True)
-    # Define model and optimizer
+    val_dataloader = dgl.dataloading.DataLoader(g,
+                                                val_nid,
+                                                sampler,
+                                                device=device,
+                                                batch_size=args.batch_size,
+                                                shuffle=True,
+                                                drop_last=False,
+                                                num_workers=0,
+                                                use_ddp=True,
+                                                use_uva=True)
+    test_dataloader = dgl.dataloading.DataLoader(g,
+                                                 test_nid,
+                                                 sampler,
+                                                 device=device,
+                                                 batch_size=args.batch_size,
+                                                 shuffle=True,
+                                                 drop_last=False,
+                                                 num_workers=0,
+                                                 use_ddp=True,
+                                                 use_uva=True)
+
+    # create model
     if args.model == "sage":
         model = SAGE(g.ndata["features"].shape[1], args.num_hidden, n_classes,
                      len(fan_out), F.relu, args.dropout)
     elif args.model == "gat":
         heads = [args.num_heads for _ in range(len(fan_out) - 1)]
         heads.append(1)
-        model = GAT(g.ndata["features"].shape[1],
-                    args.num_hidden // args.num_heads,
-                    n_classes,
-                    len(fan_out),
-                    heads,
-                    activation=F.relu,
-                    feat_dropout=args.dropout,
-                    attn_dropout=args.dropout)
+        num_hidden = args.num_hidden // args.num_heads
+        model = GAT(g.ndata["features"].shape[1], num_hidden, n_classes,
+                    len(fan_out), heads, F.elu, args.dropout)
+
     model = model.to(device)
     model = nn.parallel.DistributedDataParallel(model,
                                                 device_ids=[rank],
@@ -223,34 +240,19 @@ def run(rank, world_size, data, args):
         num_inputs_log.append(num_inputs)
 
         if (epoch + 1) % args.eval_every == 0:
-            if args.infer_method == "node":
-                tic = time.time()
-                val_acc, test_acc = evaluate_nodeclass(args, g, model,
-                                                       g.ndata["features"],
-                                                       g.ndata["labels"],
-                                                       local_val_nid,
-                                                       local_test_nid)
-                print("Part {}, Val Acc {:.4f}, Test Acc {:.4f}, time: {:.4f}".
-                      format(rank, val_acc, test_acc,
-                             time.time() - tic))
-                acc_tensor = torch.tensor([val_acc, test_acc]).cuda()
-                dist.all_reduce(acc_tensor, dist.ReduceOp.SUM)
-                acc_tensor /= world_size
-                if rank == 0:
-                    print(
-                        "All parts avg val acc {:.4f}, test acc {:.4f}".format(
-                            acc_tensor[0].item(), acc_tensor[1].item()))
-            else:
-                if dist.get_rank() == 0:
-                    tic = time.time()
-                    val_acc, test_acc = evaluate_nodeclass(
-                        args, g, model, g.ndata["features"], g.ndata["labels"],
-                        val_nid, test_nid)
-                    print(
-                        "All parts avg val acc {:.4f}, test acc {:.4f}, time: {:.4f}"
-                        .format(rank, val_acc, test_acc,
-                                time.time() - tic))
-                dist.barrier()
+            valid_acc = nodewise_inference(model, val_dataloader,
+                                           g.ndata["labels"]).cuda()
+            dist.all_reduce(valid_acc)
+            valid_acc = valid_acc / dist.get_world_size()
+
+            test_acc = nodewise_inference(model, test_dataloader,
+                                          g.ndata["labels"]).cuda()
+            dist.all_reduce(test_acc)
+            test_acc = test_acc / dist.get_world_size()
+
+            if dist.get_rank() == 0:
+                print("Valid Acc {:.4f}, Test Acc {:.4f}".format(
+                    valid_acc, test_acc))
 
     avg_epoch_time = np.mean(epoch_time_log[2:])
     avg_sample_time = np.mean(sample_time_log[2:])
@@ -418,7 +420,7 @@ if __name__ == "__main__":
         "number of trainers participated in the compress, no greater than available GPUs num"
     )
     argparser.add_argument("--lr", type=float, default=0.003)
-    argparser.add_argument("--dropout", type=float, default=0.2)
+    argparser.add_argument("--dropout", type=float, default=0.5)
     argparser.add_argument("--batch-size", type=int, default=1000)
     argparser.add_argument("--batch-size-eval", type=int, default=1000)
     argparser.add_argument("--log-every", type=int, default=20)
