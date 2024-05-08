@@ -102,7 +102,7 @@ def nodewise_inference(model, dataloader, labels, device="cuda"):
             batch_inputs = blocks[0].srcdata["features"]
             pred = model(blocks, batch_inputs).cpu()
             output_labels = labels[output_nodes.cpu()]
-            acc += (torch.argmax(pred, dim=1) == output_labels).float().sum()
+            acc += (torch.argmax(pred, dim=1).cpu() == output_labels.cpu()).float().sum()
             length += output_nodes.numel()
         return acc / length
 

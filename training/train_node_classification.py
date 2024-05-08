@@ -103,6 +103,7 @@ def run(rank, world_size, data, args):
     loss_fcn = nn.CrossEntropyLoss()
     loss_fcn = loss_fcn.to(device)
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
+    scheduler = optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.978)
 
     epoch_time_log = []
     sample_time_log = []
@@ -113,6 +114,10 @@ def run(rank, world_size, data, args):
     num_layer_seeds_log = []
     num_layer_neighbors_log = []
     num_inputs_log = []
+
+    test_accs = []
+    valid_accs = []
+
     for epoch in range(args.num_epochs):
 
         sample_time = 0
@@ -130,8 +135,8 @@ def run(rank, world_size, data, args):
             # dist.barrier()
             torch.cuda.synchronize()
         epoch_tic = time.time()
-        sample_begin = time.time()
         model.train()
+        sample_begin = time.time()
         for step, (input_nodes, seeds, blocks) in enumerate(dataloader):
             num_iters += 1
             if args.breakdown:
@@ -196,6 +201,7 @@ def run(rank, world_size, data, args):
                 # dist.barrier()
                 torch.cuda.synchronize()
             sample_begin = time.time()
+        scheduler.step()
 
         epoch_toc = time.time()
 
@@ -254,12 +260,19 @@ def run(rank, world_size, data, args):
                 print("Valid Acc {:.4f}, Test Acc {:.4f}".format(
                     valid_acc, test_acc))
 
-    avg_epoch_time = np.mean(epoch_time_log[2:])
-    avg_sample_time = np.mean(sample_time_log[2:])
-    avg_load_time = np.mean(load_time_log[2:])
-    avg_forward_time = np.mean(forward_time_log[2:])
-    avg_backward_time = np.mean(backward_time_log[2:])
-    avg_update_time = np.mean(update_time_log[2:])
+            test_accs.append(test_acc.item())
+            valid_accs.append(valid_acc.item())
+
+    if dist.get_rank() == 0:
+        print("final test acc: {}, valid acc: {}".format(
+            np.mean(test_accs[-5:]), np.mean(valid_accs[-5:])))
+
+    avg_epoch_time = np.mean(epoch_time_log[1:])
+    avg_sample_time = np.mean(sample_time_log[1:])
+    avg_load_time = np.mean(load_time_log[1:])
+    avg_forward_time = np.mean(forward_time_log[1:])
+    avg_backward_time = np.mean(backward_time_log[1:])
+    avg_update_time = np.mean(update_time_log[1:])
 
     for i in range(args.num_trainers):
         dist.barrier()
@@ -397,6 +410,7 @@ def main(args):
     else:
         test_nid = torch.tensor([]).long()
     print("start")
+
     data = train_nid, val_nid, test_nid, metadata["num_classes"], dgl_g
 
     run(rank, world_size, data, args)
