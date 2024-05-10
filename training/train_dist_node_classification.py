@@ -8,7 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import dgl
-from models import DistSAGE, compute_acc
+from models import SAGE, GAT, compute_acc
 
 torch.manual_seed(25)
 
@@ -17,7 +17,7 @@ def load_subtensor(g, seeds, input_nodes, device, load_feat=True):
     """
     Copys features and labels of a set of nodes onto GPU.
     """
-    batch_inputs = (g.ndata["features"][input_nodes].to(device)
+    batch_inputs = (g.ndata["features"][input_nodes].float().to(device)
                     if load_feat else None)
     batch_labels = g.ndata["labels"][seeds].to(device)
     return batch_inputs, batch_labels
@@ -57,14 +57,15 @@ def run(args, device, data):
         drop_last=False,
     )
     # Define model and optimizer
-    model = DistSAGE(
-        g.ndata["features"].shape[1],
-        args.num_hidden,
-        n_classes,
-        len(fan_out),
-        F.relu,
-        args.dropout,
-    )
+    if args.model == "sage":
+        model = SAGE(g.ndata["features"].shape[1], args.num_hidden, n_classes,
+                     len(fan_out), F.relu, args.dropout)
+    elif args.model == "gat":
+        heads = [args.num_heads for _ in range(len(fan_out) - 1)]
+        heads.append(1)
+        num_hidden = args.num_hidden // args.num_heads
+        model = GAT(g.ndata["features"].shape[1], num_hidden, n_classes,
+                    len(fan_out), heads, F.elu, args.dropout)
     model = model.to(device)
     if not args.standalone:
         if args.num_trainers == -1:
@@ -75,6 +76,7 @@ def run(args, device, data):
     loss_fcn = nn.CrossEntropyLoss()
     loss_fcn = loss_fcn.to(device)
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
+    scheduler = optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.978)
 
     pb = g.get_partition_book()
     partition_range = [0]
@@ -112,17 +114,6 @@ def run(args, device, data):
             epoch_tic = time.time()
             sample_begin = time.time()
             for step, (input_nodes, seeds, blocks) in enumerate(dataloader):
-                num_iters += 1
-                if args.breakdown:
-                    dist.barrier()
-                    torch.cuda.synchronize()
-                sample_time += time.time() - sample_begin
-
-                load_begin = time.time()
-                batch_inputs, batch_labels = load_subtensor(
-                    g, seeds, input_nodes, "cpu")
-                batch_labels = batch_labels.long()
-                num_seeds += len(blocks[-1].dstdata[dgl.NID])
                 for l, block in enumerate(blocks):
                     layer_seeds = block.dstdata[dgl.NID]
                     remote_layer_seeds_num = torch.sum(
@@ -131,14 +122,21 @@ def run(args, device, data):
                                 layer_seeds < partition_range[part_id]).item()
                     num_layer_seeds += remote_layer_seeds_num
                     num_layer_neighbors += remote_layer_seeds_num * fan_out[l]
+                blocks = [block.to(device) for block in blocks]
+                num_iters += 1
+                if args.breakdown:
+                    torch.cuda.synchronize()
+                sample_time += time.time() - sample_begin
+
+                load_begin = time.time()
+                batch_inputs = g.ndata["features"][input_nodes].float().to(
+                    device)
+                batch_labels = g.ndata["labels"][seeds].to(device).long()
+                num_seeds += len(blocks[-1].dstdata[dgl.NID])
                 num_inputs += torch.sum(input_nodes >= partition_range[
                     part_id + 1]).item() + torch.sum(
                         input_nodes < partition_range[part_id]).item()
-                blocks = [block.to(device) for block in blocks]
-                batch_inputs = batch_inputs.to(device)
-                batch_labels = batch_labels.to(device)
                 if args.breakdown:
-                    dist.barrier()
                     torch.cuda.synchronize()
                 load_time += time.time() - load_begin
 
@@ -146,7 +144,6 @@ def run(args, device, data):
                 batch_pred = model(blocks, batch_inputs)
                 loss = loss_fcn(batch_pred, batch_labels)
                 if args.breakdown:
-                    dist.barrier()
                     torch.cuda.synchronize()
                 forward_time += time.time() - forward_start
 
@@ -154,14 +151,12 @@ def run(args, device, data):
                 optimizer.zero_grad()
                 loss.backward()
                 if args.breakdown:
-                    dist.barrier()
                     torch.cuda.synchronize()
                 backward_time += time.time() - backward_begin
 
                 update_start = time.time()
                 optimizer.step()
                 if args.breakdown:
-                    dist.barrier()
                     torch.cuda.synchronize()
                 update_time += time.time() - update_start
 
@@ -183,9 +178,9 @@ def run(args, device, data):
                             train_acc_tensor[0].item()))
 
                 if args.breakdown:
-                    dist.barrier()
                     torch.cuda.synchronize()
                 sample_begin = time.time()
+            scheduler.step()
 
             epoch_toc = time.time()
 
@@ -229,34 +224,34 @@ def run(args, device, data):
         num_layer_neighbors_log.append(num_layer_neighbors)
         num_inputs_log.append(num_inputs)
 
-        if (epoch + 1) % args.eval_every == 0 and epoch != 0:
-            start = time.time()
-            val_acc, test_acc = evaluate(
-                model if args.standalone else model.module,
-                g,
-                g.ndata["features"],
-                g.ndata["labels"],
-                val_nid,
-                test_nid,
-                args.batch_size_eval,
-                device,
-            )
-            print("Part {}, Val Acc {:.4f}, Test Acc {:.4f}, time: {:.4f}".
-                  format(dist.get_rank(), val_acc, test_acc,
-                         time.time() - start))
-            acc_tensor = torch.tensor([val_acc, test_acc]).cuda()
-            dist.all_reduce(acc_tensor, dist.ReduceOp.SUM)
-            acc_tensor /= dist.get_world_size()
-            if dist.get_rank() == 0:
-                print("All parts avg val acc {:.4f}, test acc {:.4f}".format(
-                    acc_tensor[0].item(), acc_tensor[1].item()))
+        # if (epoch + 1) % args.eval_every == 0 and epoch != 0:
+        #     start = time.time()
+        #     val_acc, test_acc = evaluate(
+        #         model if args.standalone else model.module,
+        #         g,
+        #         g.ndata["features"],
+        #         g.ndata["labels"],
+        #         val_nid,
+        #         test_nid,
+        #         args.batch_size_eval,
+        #         device,
+        #     )
+        #     print("Part {}, Val Acc {:.4f}, Test Acc {:.4f}, time: {:.4f}".
+        #           format(dist.get_rank(), val_acc, test_acc,
+        #                  time.time() - start))
+        #     acc_tensor = torch.tensor([val_acc, test_acc]).cuda()
+        #     dist.all_reduce(acc_tensor, dist.ReduceOp.SUM)
+        #     acc_tensor /= dist.get_world_size()
+        #     if dist.get_rank() == 0:
+        #         print("All parts avg val acc {:.4f}, test acc {:.4f}".format(
+        #             acc_tensor[0].item(), acc_tensor[1].item()))
 
-    avg_epoch_time = np.mean(epoch_time_log[2:])
-    avg_sample_time = np.mean(sample_time_log[2:])
-    avg_load_time = np.mean(load_time_log[2:])
-    avg_forward_time = np.mean(forward_time_log[2:])
-    avg_backward_time = np.mean(backward_time_log[2:])
-    avg_update_time = np.mean(update_time_log[2:])
+    avg_epoch_time = np.mean(epoch_time_log[1:])
+    avg_sample_time = np.mean(sample_time_log[1:])
+    avg_load_time = np.mean(load_time_log[1:])
+    avg_forward_time = np.mean(forward_time_log[1:])
+    avg_backward_time = np.mean(backward_time_log[1:])
+    avg_update_time = np.mean(update_time_log[1:])
 
     for i in range(args.num_trainers):
         dist.barrier()
@@ -347,26 +342,26 @@ def main(args):
     train_nid = dgl.distributed.node_split(g.ndata["train_mask"],
                                            pb,
                                            force_even=True)
-    if args.graph_name == "ogb-products" or args.DistGraph == "ogb-paper100M":
-        val_nid = dgl.distributed.node_split(g.ndata["val_mask"],
-                                             pb,
-                                             force_even=True)
-        test_nid = dgl.distributed.node_split(g.ndata["test_mask"],
-                                              pb,
-                                              force_even=True)
-    elif args.graph_name == "mag240m":
-        val_nid = dgl.distributed.node_split(g.ndata["valid_mask"],
-                                             pb,
-                                             force_even=True)
-        test_nid = dgl.distributed.node_split(g.ndata["test_mask"],
-                                              pb,
-                                              force_even=True)
-    else:
-        g.ndata["labels"] = torch.load(
-            "/home/ubuntu/workspace/partition_dataset/friendster_labels.pt")
-        g.ndata["features"] = g.ndata.pop("feat")
-        val_nid = torch.tensor([])
-        test_nid = torch.tensor([])
+
+    val_nid = dgl.distributed.node_split(g.ndata["val_mask"],
+                                         pb,
+                                         force_even=True)
+    test_nid = dgl.distributed.node_split(g.ndata["test_mask"],
+                                          pb,
+                                          force_even=True)
+    if "features" not in g.ndata:
+        if args.graph_name == "ogb-products":
+            feature_dim = 100
+            feature_dtype = torch.float32
+        elif args.graph_name == "ogb-paper100M":
+            feature_dim = 128
+            feature_dtype = torch.float32
+        elif args.graph_name == "mag240m":
+            feature_dim = 768
+            feature_dtype = torch.float16
+        g.ndata["features"] = torch.randn((g.num_nodes(), feature_dim),
+                                          dtype=feature_dtype)
+
     local_nid = pb.partid2nids(pb.partid).detach().numpy()
     print("part {}, train: {} (local: {}), val: {} (local: {}), test: {} "
           "(local: {})".format(
@@ -382,9 +377,8 @@ def main(args):
     device = torch.device("cuda:" + str(dev_id))
     torch.cuda.set_device(device)
     labels = g.ndata["labels"][np.arange(g.num_nodes())]
-    n_classes = len(
-        torch.unique(labels[torch.logical_not(torch.isnan(labels))]))
-    print("#labels:", n_classes)
+    n_classes = torch.max(labels[~torch.isnan(labels)]).item() + 1
+    print("num_classes: {}".format(n_classes))
 
     # Pack data
     data = train_nid, val_nid, test_nid, n_classes, g
@@ -411,18 +405,23 @@ if __name__ == "__main__":
     parser.add_argument(
         "--num_trainers",
         type=int,
-        default=-1,
+        default=8,
         help="the number of GPU device. Use -1 for CPU training",
     )
     parser.add_argument("--num_epochs", type=int, default=20)
-    parser.add_argument("--num_hidden", type=int, default=32)
-    parser.add_argument("--fan_out", type=str, default="12,12,12")
-    parser.add_argument("--batch_size", type=int, default=1000)
+    parser.add_argument("--model",
+                        type=str,
+                        default="sage",
+                        choices=["sage", "gat"])
+    parser.add_argument("--num_hidden", type=int, default=128)
+    parser.add_argument("--num_heads", type=int, default=8)
+    parser.add_argument("--fan_out", type=str, default="20,20,20")
+    parser.add_argument("--batch_size", type=int, default=1536)
     parser.add_argument("--batch_size_eval", type=int, default=100000)
     parser.add_argument("--log_every", type=int, default=20)
-    parser.add_argument("--eval_every", type=int, default=5)
+    parser.add_argument("--eval_every", type=int, default=999)
     parser.add_argument("--lr", type=float, default=0.003)
-    parser.add_argument("--dropout", type=float, default=0.2)
+    parser.add_argument("--dropout", type=float, default=0.5)
     parser.add_argument("--local_rank",
                         type=int,
                         help="get rank of the process")
