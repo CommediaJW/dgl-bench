@@ -54,6 +54,7 @@ def run(rank, world_size, data, args):
         prefetch_node_feats=["features"],
         prefetch_labels=["labels"],
     )
+    print("Dataloader")
     dataloader = dgl.dataloading.DataLoader(g,
                                             train_nid,
                                             sampler,
@@ -117,7 +118,7 @@ def run(rank, world_size, data, args):
 
     test_accs = []
     valid_accs = []
-
+    print("start")
     for epoch in range(args.num_epochs):
 
         sample_time = 0
@@ -409,7 +410,6 @@ def main(args):
         test_nid = g["test_idx"]
     else:
         test_nid = torch.tensor([]).long()
-    print("start")
 
     data = train_nid, val_nid, test_nid, metadata["num_classes"], dgl_g
 

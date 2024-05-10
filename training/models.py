@@ -68,11 +68,15 @@ class GAT(nn.Module):
         for i in range(0, n_layers):
             in_dim = in_feats if i == 0 else n_hidden * n_heads[i - 1]
             out_dim = n_classes if i == n_layers - 1 else n_hidden
-            self.layers.append(
-                dglnn.GATConv(in_dim,
-                              out_dim,
-                              n_heads[i],
-                              allow_zero_in_degree=True))
+            if i == 0:
+                self.layers.append(
+                    dglnn.SAGEConv(in_dim, out_dim * n_heads[i], "mean"))
+            else:
+                self.layers.append(
+                    dglnn.GATConv(in_dim,
+                                  out_dim,
+                                  n_heads[i],
+                                  allow_zero_in_degree=True))
         self.dropout = nn.Dropout(dropout)
         self.activation = activation
 
@@ -102,7 +106,8 @@ def nodewise_inference(model, dataloader, labels, device="cuda"):
             batch_inputs = blocks[0].srcdata["features"]
             pred = model(blocks, batch_inputs).cpu()
             output_labels = labels[output_nodes.cpu()]
-            acc += (torch.argmax(pred, dim=1).cpu() == output_labels.cpu()).float().sum()
+            acc += (torch.argmax(
+                pred, dim=1).cpu() == output_labels.cpu()).float().sum()
             length += output_nodes.numel()
         return acc / length
 
