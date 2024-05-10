@@ -252,6 +252,9 @@ def run(args, device, data):
     avg_forward_time = np.mean(forward_time_log[1:])
     avg_backward_time = np.mean(backward_time_log[1:])
     avg_update_time = np.mean(update_time_log[1:])
+    avg_remote_inputs = np.mean(num_inputs_log[1:])
+    avg_remote_seeds = np.mean(num_layer_seeds_log[1:])
+    avg_remote_neighbors = np.mean(num_layer_neighbors_log[1:])
 
     for i in range(args.num_trainers):
         dist.barrier()
@@ -271,9 +274,8 @@ def run(args, device, data):
                              dist.get_rank(), avg_epoch_time, avg_sample_time,
                              avg_load_time, avg_forward_time,
                              avg_backward_time, avg_update_time,
-                             np.mean(num_inputs_log[2:]),
-                             np.mean(num_layer_seeds_log[2:]),
-                             np.mean(num_layer_neighbors_log[2:])))
+                             avg_remote_inputs, avg_remote_seeds,
+                             avg_remote_neighbors))
             print(timetable)
     all_reduce_tensor = torch.tensor([0], device="cuda", dtype=torch.float32)
 
@@ -309,6 +311,18 @@ def run(args, device, data):
     dist.all_reduce(all_reduce_tensor, dist.ReduceOp.SUM)
     train_total_num = all_reduce_tensor[0].item()
 
+    all_reduce_tensor[0] = avg_remote_inputs
+    dist.all_reduce(all_reduce_tensor, dist.ReduceOp.SUM)
+    avg_remote_inputs = all_reduce_tensor[0].item()
+
+    all_reduce_tensor[0] = avg_remote_seeds
+    dist.all_reduce(all_reduce_tensor, dist.ReduceOp.SUM)
+    avg_remote_seeds = all_reduce_tensor[0].item()
+
+    all_reduce_tensor[0] = avg_remote_neighbors
+    dist.all_reduce(all_reduce_tensor, dist.ReduceOp.SUM)
+    avg_remote_neighbors = all_reduce_tensor[0].item()
+
     if dist.get_rank() == 0:
         timetable = ("=====================\n"
                      "All reduce time:\n"
@@ -319,6 +333,9 @@ def run(args, device, data):
                      "Forward Time(s): {:.4f}\n"
                      "Backward Time(s): {:.4f}\n"
                      "Update Time(s): {:.4f}\n"
+                     "#Remote Loading Nodes: {}\n"
+                     "#Remote Seeds: {}\n"
+                     "#Remote Neighbors: {}\n"
                      "=====================".format(
                          train_total_num / all_reduce_epoch_time,
                          all_reduce_epoch_time,
