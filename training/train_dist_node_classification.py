@@ -8,6 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import dgl
+import shmtensor
 from models import SAGE, GAT, compute_acc
 
 torch.manual_seed(25)
@@ -378,8 +379,18 @@ def main(args):
         elif args.graph_name == "mag240m":
             feature_dim = 768
             feature_dtype = torch.float16
-        g.ndata["features"] = torch.randn((g.num_nodes(), feature_dim),
-                                          dtype=feature_dtype)
+        features = dgl.distributed.DistTensor(
+            (g.num_nodes(), feature_dim),
+            feature_dtype,
+            "features",
+            attach=False,
+        )
+        if dist.get_rank() == 0:
+            features[:] = torch.randn((g.num_nodes(), feature_dim),
+                                      dtype=feature_dtype)
+        dist.barrier()
+        print(features)
+        g.ndata["features"] = features
 
     local_nid = pb.partid2nids(pb.partid).detach().numpy()
     print("part {}, train: {} (local: {}), val: {} (local: {}), test: {} "
