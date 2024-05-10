@@ -333,18 +333,16 @@ def run(args, device, data):
                      "Forward Time(s): {:.4f}\n"
                      "Backward Time(s): {:.4f}\n"
                      "Update Time(s): {:.4f}\n"
-                     "#Remote Loading Nodes: {}\n"
-                     "#Remote Seeds: {}\n"
-                     "#Remote Neighbors: {}\n"
+                     "#Remote Loading Nodes: {:.4f}\n"
+                     "#Remote Seeds: {:.4f}\n"
+                     "#Remote Neighbors: {:.4f}\n"
                      "=====================".format(
                          train_total_num / all_reduce_epoch_time,
-                         all_reduce_epoch_time,
-                         all_reduce_sample_time,
-                         all_reduce_load_time,
-                         all_reduce_forward_time,
-                         all_reduce_backward_time,
-                         all_reduce_update_time,
-                     ))
+                         all_reduce_epoch_time, all_reduce_sample_time,
+                         all_reduce_load_time, all_reduce_forward_time,
+                         all_reduce_backward_time, all_reduce_update_time,
+                         avg_remote_inputs, avg_remote_seeds,
+                         avg_remote_neighbors))
         print(timetable)
 
 
