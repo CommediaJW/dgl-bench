@@ -305,6 +305,10 @@ def run(args, device, data):
     all_reduce_update_time = all_reduce_tensor[0].item() / dist.get_world_size(
     )
 
+    all_reduce_tensor[0] = train_nid.shape[0]
+    dist.all_reduce(all_reduce_tensor, dist.ReduceOp.SUM)
+    train_total_num = all_reduce_tensor[0].item()
+
     if dist.get_rank() == 0:
         timetable = ("=====================\n"
                      "All reduce time:\n"
@@ -316,7 +320,7 @@ def run(args, device, data):
                      "Backward Time(s): {:.4f}\n"
                      "Update Time(s): {:.4f}\n"
                      "=====================".format(
-                         train_nid.shape[0] / all_reduce_epoch_time,
+                         train_total_num / all_reduce_epoch_time,
                          all_reduce_epoch_time,
                          all_reduce_sample_time,
                          all_reduce_load_time,
