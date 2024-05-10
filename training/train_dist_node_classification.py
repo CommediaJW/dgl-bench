@@ -8,10 +8,17 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import dgl
-import shmtensor
 from models import SAGE, GAT, compute_acc
 
 torch.manual_seed(25)
+
+
+def feature_initializer(shape, dtype):
+    size = []
+    for s in shape:
+        size.append(s)
+    tensor = torch.randn(shape, dtype=dtype)
+    return tensor
 
 
 def load_subtensor(g, seeds, input_nodes, device, load_feat=True):
@@ -370,6 +377,7 @@ def main(args):
                                           pb,
                                           force_even=True)
     if "features" not in g.ndata:
+        print("Generate features...")
         if args.graph_name == "ogb-products":
             feature_dim = 100
             feature_dtype = torch.float32
@@ -379,17 +387,12 @@ def main(args):
         elif args.graph_name == "mag240m":
             feature_dim = 768
             feature_dtype = torch.float16
-        features = dgl.distributed.DistTensor(
-            (g.num_nodes(), feature_dim),
-            feature_dtype,
-            "features",
-            attach=False,
-        )
-        if dist.get_rank() == 0:
-            features[:] = torch.randn((g.num_nodes(), feature_dim),
-                                      dtype=feature_dtype)
+        features = dgl.distributed.DistTensor((g.num_nodes(), feature_dim),
+                                              feature_dtype,
+                                              "features",
+                                              attach=False,
+                                              init_func=feature_initializer)
         dist.barrier()
-        print(features)
         g.ndata["features"] = features
 
     local_nid = pb.partid2nids(pb.partid).detach().numpy()
@@ -407,7 +410,7 @@ def main(args):
     device = torch.device("cuda:" + str(dev_id))
     torch.cuda.set_device(device)
     labels = g.ndata["labels"][np.arange(g.num_nodes())]
-    n_classes = torch.max(labels[~torch.isnan(labels)]).item() + 1
+    n_classes = int(torch.max(labels[~torch.isnan(labels)]).item() + 1)
     print("num_classes: {}".format(n_classes))
 
     # Pack data
